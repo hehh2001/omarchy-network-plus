@@ -1,0 +1,201 @@
+#!/bin/bash
+
+# User-override copy for zzb.network:
+# Prefer the physical NetworkManager connection (wifi/ethernet) instead of
+# following the internet route, which can point at tailscale0 when a
+# Tailscale exit node is active.
+
+# omarchy:summary=Print active network status for the shell
+# omarchy:group=network
+# omarchy:args=[--verbose]
+
+verbose=false
+internet_probe=1.1.1.1
+
+case "${1:-}" in
+  "")
+    ;;
+  --verbose)
+    verbose=true
+    ;;
+  *)
+    echo "Usage: omarchy-network-status [--verbose]" >&2
+    exit 2
+    ;;
+esac
+
+# Pick the interface the panel should describe: an active physical
+# NetworkManager device first, then a connecting/disconnected physical NIC,
+# and only as a last resort the kernel route.  The route fallback can point
+# at tailscale0 when a Tailscale exit node is active, so it must never be
+# used while this machine still has a managed wired/wireless NIC -- during a
+# DHCP<->static reapply the physical device briefly leaves "connected", and
+# without this preference the hero/details would show the tailnet address.
+pick_device() {
+  local dev state candidate
+
+  dev=$(nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null | awk -F: '
+    $2 == "ethernet" && $3 ~ /^connected/ { print $1; exit }
+    $2 == "wifi" && $3 ~ /^connected/ { print $1; exit }
+  ')
+
+  if [[ -n $dev ]]; then
+    echo "$dev"
+    return
+  fi
+
+  dev=$(nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null | awk -F: '
+    $2 == "ethernet" && $3 ~ /^connecting/ { print $1; exit }
+    $2 == "wifi" && $3 ~ /^connecting/ { print $1; exit }
+  ')
+
+  if [[ -n $dev ]]; then
+    echo "$dev"
+    return
+  fi
+
+  # Prefer a cable-present but not-yet-connected NIC over a dead/unavailable
+  # adapter, otherwise eno1 (no cable) would win over enp1s0 (cable present,
+  # currently reconfiguring) whenever enp1s0 leaves the connected state.
+  candidate=""
+  while IFS=: read -r dev state; do
+    case "$state" in
+      connected*|connecting*) continue ;;
+    esac
+
+    if [[ -r /sys/class/net/$dev/carrier ]] && [[ $(cat "/sys/class/net/$dev/carrier" 2>/dev/null) == 1 ]]; then
+      echo "$dev"
+      return
+    fi
+    [[ -z $candidate ]] && candidate=$dev
+  done < <(nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null | awk -F: '$2 == "ethernet" || $2 == "wifi" { print $1 ":" $3 }')
+
+  if [[ -n $candidate ]]; then
+    echo "$candidate"
+    return
+  fi
+
+  ip route get "$internet_probe" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+print_status() {
+  local device nm state ssid signal freq
+
+  device=$(pick_device)
+
+  if [[ -z $device ]]; then
+    printf 'disconnected\t\t\t\n'
+    return
+  fi
+
+  nm=$(nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION dev show "$device" 2>/dev/null)
+  state=$(awk -F: '$1 == "GENERAL.STATE" { print $2; exit }' <<<"$nm")
+
+  # pick_device may return a physical NIC that is connecting, disconnected or
+  # unavailable.  Only an activated (100) device is a real connection; anything
+  # else must read as disconnected rather than pretending the NIC is up.
+  if [[ $state != 100* ]]; then
+    printf 'disconnected\t\t\t\n'
+    return
+  fi
+
+  if [[ ! -d /sys/class/net/$device/wireless ]]; then
+    printf 'ethernet\t%s\t\t\n' "$device"
+    return
+  fi
+
+  ssid=$(awk -F: '$1 == "GENERAL.CONNECTION" { print $2; exit }' <<<"$nm")
+  signal=$(nmcli -t -f IN-USE,SIGNAL dev wifi list ifname "$device" --rescan no 2>/dev/null | awk -F: '$1 == "*" { print $2; exit }')
+  freq=$(iw dev "$device" link 2>/dev/null | awk '/freq:/ { print $2; exit }')
+
+  printf 'wifi\t%s\t%s\t%s\n' "${ssid:-$device}" "$signal" "$freq"
+}
+
+ping_latency_ms() {
+  local host=$1
+
+  LC_ALL=C ping -n -c 1 -W 1 "$host" 2>/dev/null | awk -F'time[=<]' '/time[=<]/ { split($2, parts, " "); print parts[1]; exit }'
+}
+
+print_ping_samples() {
+  local gateway=$1
+  local tmpdir router_file internet_file
+  local router_pid="" internet_pid=""
+
+  omarchy-cmd-present ping || return
+  tmpdir=$(mktemp -d) || return
+  router_file="$tmpdir/router"
+  internet_file="$tmpdir/internet"
+
+  if [[ -n $gateway ]]; then
+    ping_latency_ms "$gateway" >"$router_file" &
+    router_pid=$!
+  fi
+
+  ping_latency_ms "$internet_probe" >"$internet_file" &
+  internet_pid=$!
+
+  if [[ -n $router_pid ]]; then
+    wait "$router_pid"
+    printf 'router_ping_ms\t%s\n' "$(cat "$router_file")"
+  fi
+
+  wait "$internet_pid"
+  printf 'internet_ping_ms\t%s\n' "$(cat "$internet_file")"
+  rm -rf "$tmpdir"
+}
+
+print_verbose() {
+  local iface gw src prefix link
+
+  iface=$(pick_device)
+  [[ -z $iface ]] && return
+
+  src=$(ip -j -4 addr show "$iface" 2>/dev/null | jq -r '.[0].addr_info[]? | select(.family == "inet" and .scope == "global") | .local // ""' 2>/dev/null | head -n 1)
+  prefix=$(ip -j -4 addr show "$iface" 2>/dev/null | jq -r '.[0].addr_info[]? | select(.family == "inet" and .scope == "global") | .prefixlen // ""' 2>/dev/null | head -n 1)
+
+  # Only report the gateway that belongs to this physical interface.  Falling
+  # back to `route get` would happily return the tailscale0 gateway while the
+  # NIC is reconfiguring, which makes the panel look like it switched to the
+  # tailnet even though it is still describing the Ethernet adapter.
+  gw=$(ip -j route show dev "$iface" default 2>/dev/null | jq -r '.[0].gateway // ""' 2>/dev/null)
+
+  printf 'iface\t%s\n' "$iface"
+  printf 'ip\t%s\n' "$src"
+  printf 'prefix\t%s\n' "$prefix"
+  printf 'gateway\t%s\n' "$gw"
+
+  if [[ -r /sys/class/net/$iface/statistics/rx_bytes ]]; then
+    printf 'rx_bytes\t%s\n' "$(cat /sys/class/net/$iface/statistics/rx_bytes)"
+  fi
+  if [[ -r /sys/class/net/$iface/statistics/tx_bytes ]]; then
+    printf 'tx_bytes\t%s\n' "$(cat /sys/class/net/$iface/statistics/tx_bytes)"
+  fi
+
+  if [[ -d /sys/class/net/$iface/wireless ]]; then
+    printf 'type\twifi\n'
+
+    if omarchy-cmd-present iw; then
+      link=$(iw dev "$iface" link 2>/dev/null)
+
+      if [[ -n $link ]]; then
+        printf 'ssid\t%s\n' "$(awk '/SSID:/ { sub(/.*SSID: /, ""); print; exit }' <<<"$link")"
+        printf 'signal_dbm\t%s\n' "$(awk '/signal:/ { print $2; exit }' <<<"$link")"
+        printf 'freq\t%s\n' "$(awk '/freq:/ { print $2; exit }' <<<"$link")"
+        printf 'bitrate\t%s %s\n' "$(awk '/tx bitrate:/ { print $3; exit }' <<<"$link")" "$(awk '/tx bitrate:/ { print $4; exit }' <<<"$link")"
+      fi
+    fi
+  else
+    printf 'type\tethernet\n'
+    [[ -r /sys/class/net/$iface/speed ]] && printf 'speed\t%s\n' "$(cat /sys/class/net/$iface/speed)"
+    [[ -r /sys/class/net/$iface/duplex ]] && printf 'duplex\t%s\n' "$(cat /sys/class/net/$iface/duplex)"
+  fi
+
+  print_ping_samples "$gw"
+}
+
+if [[ $verbose == "true" ]]; then
+  print_verbose
+else
+  print_status
+fi
