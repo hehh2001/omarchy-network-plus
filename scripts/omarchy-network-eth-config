@@ -35,15 +35,14 @@ device_carrier() {
   fi
 }
 
-# The profile currently bound to the device: active connection first, then the
-# first saved 802-3-ethernet profile that names this interface (or MAC), with
-# autoconnect profiles preferred so the panel edits what will actually be used.
+# Return the UUID of the profile bound to the device. UUIDs are authoritative;
+# connection names are user-editable and need not be unique.
 profile_for_device() {
   local dev=$1
-  local active profile
+  local active
   local devmac uuid type iface mac name auto found=""
 
-  active=$(nm_get GENERAL.CONNECTION device show "$dev")
+  active=$(nm_get GENERAL.CON-UUID device show "$dev")
   if [[ -n $active && $active != "--" ]]; then
     echo "$active"
     return 0
@@ -62,10 +61,10 @@ profile_for_device() {
     [[ -n $name ]] || continue
     auto=$(nm_get connection.autoconnect connection show uuid "$uuid")
     if [[ -z $found ]]; then
-      found=$name
+      found=$uuid
     fi
     if [[ $auto == yes ]]; then
-      echo "$name"
+      echo "$uuid"
       return 0
     fi
   done < <(nmcli -e no -g UUID,TYPE connection show)
@@ -82,7 +81,7 @@ clean_dns() {
 }
 
 list_devices() {
-  local line dev type state carrier profile method addrs addr prefix gateway dns live_ip live_gw
+  local line dev type state carrier profile_uuid profile method addrs addr prefix gateway dns live_ip live_gw
 
   while IFS=: read -r dev type state; do
     [[ $type == ethernet ]] || continue
@@ -91,19 +90,21 @@ list_devices() {
     carrier=$(device_carrier "$dev")
     state=${state%% *}
 
-    profile=$(profile_for_device "$dev")
+    profile_uuid=$(profile_for_device "$dev")
+    profile=""
     method=auto
     addr=""
     prefix=""
     gateway=""
     dns=""
 
-    if [[ -n $profile ]]; then
-      method=$(nm_get ipv4.method connection show "$profile")
+    if [[ -n $profile_uuid ]]; then
+      profile=$(nm_get connection.id connection show uuid "$profile_uuid")
+      method=$(nm_get ipv4.method connection show uuid "$profile_uuid")
       [[ -n $method ]] || method=auto
 
       if [[ $method == manual ]]; then
-        addrs=$(nm_get ipv4.addresses connection show "$profile" | first_line)
+        addrs=$(nm_get ipv4.addresses connection show uuid "$profile_uuid" | first_line)
         if [[ -n $addrs ]]; then
           if [[ $addrs == */* ]]; then
             addr=${addrs%/*}
@@ -112,8 +113,8 @@ list_devices() {
             addr=$addrs
           fi
         fi
-        gateway=$(nm_get ipv4.gateway connection show "$profile" | first_line)
-        dns=$(nm_get ipv4.dns connection show "$profile" | clean_dns)
+        gateway=$(nm_get ipv4.gateway connection show uuid "$profile_uuid" | first_line)
+        dns=$(nm_get ipv4.dns connection show uuid "$profile_uuid" | clean_dns)
       fi
     fi
 
@@ -145,7 +146,7 @@ ensure_profile() {
     ifname "$dev" \
     connection.autoconnect yes \
     >/dev/null
-  echo "$con_name"
+  profile_for_device "$dev"
 }
 
 # True once NM has the requested IPv4 state on the device.  For manual we also
@@ -154,23 +155,29 @@ ensure_profile() {
 # is noticed, and without this check the panel would claim success while the
 # NIC was actually still on the old address or already down.
 device_has_ipv4_state() {
-  local dev=$1 mode=$2 expected_ip=${3:-}
-  local state addr
+  local dev=$1 profile_uuid=$2 mode=$3 expected_ip=${4:-}
+  local state active_uuid addr dhcp
 
   state=$(device_state "$dev")
   [[ $state == connected* ]] || return 1
+  active_uuid=$(nm_get GENERAL.CON-UUID device show "$dev")
+  [[ $active_uuid == "$profile_uuid" ]] || return 1
 
   if [[ $mode == manual && -n $expected_ip ]]; then
     addr=$(nm_get IP4.ADDRESS device show "$dev" | first_line)
     [[ $addr == "$expected_ip"/* ]] || return 1
+  elif [[ $mode == dhcp ]]; then
+    addr=$(nm_get IP4.ADDRESS device show "$dev" | first_line)
+    dhcp=$(nm_get DHCP4.OPTION device show "$dev")
+    [[ -n $addr && $dhcp == *"ip_address ="* ]] || return 1
   fi
 
   return 0
 }
 
 apply_connection() {
-  local dev=$1 profile=$2 mode=$3 expected_ip=${4:-}
-  local state carrier i
+  local dev=$1 profile_uuid=$2 mode=$3 old_mode=$4 expected_ip=${5:-}
+  local state carrier active_uuid i
 
   state=$(device_state "$dev")
   carrier=$(device_carrier "$dev")
@@ -179,7 +186,7 @@ apply_connection() {
   # The profile will come up on its own when a cable is attached.
   [[ $carrier == 1 ]] || return 0
 
-  if [[ $state == connected* && $mode != dhcp ]]; then
+  if [[ $state == connected* && $old_mode == "$mode" && $mode == manual ]]; then
     # Least disruptive path: reapply the updated profile in place. NM can
     # return success before an async failure, so wait briefly and verify the
     # device really is connected with the requested address.  If not, fall
@@ -189,7 +196,7 @@ apply_connection() {
     # instant success without an actual DHCP lease.
     if nmcli device reapply "$dev" >/dev/null 2>&1; then
       for ((i = 0; i < 5; i++)); do
-        if device_has_ipv4_state "$dev" "$mode" "$expected_ip"; then
+        if device_has_ipv4_state "$dev" "$profile_uuid" "$mode" "$expected_ip"; then
           return 0
         fi
         sleep 1
@@ -197,16 +204,30 @@ apply_connection() {
     fi
   fi
 
-  # Full reactivation is authoritative: `nmcli connection up --wait` exits
-  # non-zero if NetworkManager cannot bring the profile up (e.g. the static IP
-  # is already in use).  Previously errors here were swallowed, so the UI said
-  # "Applied" and the only working fix appeared to be a reboot.
-  nmcli --wait 15 connection up "$profile"
+  # A method transition needs a clean deactivate/activate cycle. In particular,
+  # activating an already-active profile after manual -> auto can leave the old
+  # static address in the applied connection. Only this NIC is cycled; the host
+  # and NetworkManager stay up.
+  active_uuid=$(nm_get GENERAL.CON-UUID device show "$dev")
+  if [[ $active_uuid == "$profile_uuid" ]]; then
+    nmcli --wait 10 connection down uuid "$profile_uuid" >/dev/null
+  fi
+  nmcli --wait 30 connection up uuid "$profile_uuid" ifname "$dev" >/dev/null
+
+  for ((i = 0; i < 10; i++)); do
+    if device_has_ipv4_state "$dev" "$profile_uuid" "$mode" "$expected_ip"; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Error: NetworkManager activated $dev but the requested $mode IPv4 configuration did not take effect." >&2
+  return 1
 }
 
 set_command() {
   local dev mode
-  local profile ip prefix gateway dns
+  local profile old_mode ip prefix gateway dns
 
   if (($# < 2)); then
     echo "Usage: omarchy-network-eth-config set <device> <dhcp|manual> [ip] [prefix] [gateway] [dns]" >&2
@@ -221,10 +242,11 @@ set_command() {
     echo "Error: could not find or create a NetworkManager profile for $dev." >&2
     exit 1
   fi
+  old_mode=$(nm_get ipv4.method connection show uuid "$profile")
 
   case $mode in
     dhcp|auto)
-      nmcli connection modify "$profile" \
+      nmcli connection modify uuid "$profile" \
         connection.autoconnect yes \
         ipv4.method auto \
         ipv4.addresses "" \
@@ -252,7 +274,7 @@ set_command() {
       fi
 
       if [[ -n $dns ]]; then
-        nmcli connection modify "$profile" \
+        nmcli connection modify uuid "$profile" \
           connection.autoconnect yes \
           ipv4.method manual \
           ipv4.addresses "$ip/$prefix" \
@@ -262,7 +284,7 @@ set_command() {
           ipv4.ignore-auto-dns yes \
           >/dev/null
       else
-        nmcli connection modify "$profile" \
+        nmcli connection modify uuid "$profile" \
           connection.autoconnect yes \
           ipv4.method manual \
           ipv4.addresses "$ip/$prefix" \
@@ -280,7 +302,8 @@ set_command() {
       ;;
   esac
 
-  apply_connection "$dev" "$profile" "$mode" "${ip:-}"
+  [[ $mode != auto ]] || mode=dhcp
+  apply_connection "$dev" "$profile" "$mode" "$old_mode" "${ip:-}"
 }
 
 usage() {

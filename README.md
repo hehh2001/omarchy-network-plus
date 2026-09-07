@@ -18,6 +18,9 @@ failure messages.
   the bar panel.
 - Apply a static IP or DHCP change immediately through NetworkManager — no
   reboot required.
+- Cleanly reactivate only the selected NIC when switching between DHCP and
+  static addressing, then verify the requested live IPv4 state before the UI
+  reports success.
 - Surface activation errors (for example a static IP already in use on the
   LAN) instead of reporting a false success.
 - Avoids showing Tailscale/tailnet addresses during a DHCP/static transition:
