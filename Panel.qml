@@ -2211,7 +2211,11 @@ Panel {
     }
 
     function applyConfig() {
-      if (busy || !info.device) return
+      // Serialize wired reconfiguration. wiredApplyBusy is panel-wide because
+      // NetworkManager activations can overlap across rows, and clearing it
+      // when the first of two concurrent applies exits would resume details
+      // polling while the second NIC is still transitioning.
+      if (busy || root.wiredApplyBusy || !info.device) return
       statusText = ""
       failed = false
 
@@ -2300,6 +2304,7 @@ Panel {
 
           ToggleSwitch {
             checked: !wiredRow.manualMode
+            enabled: !wiredRow.busy && !root.wiredApplyBusy
             foreground: root.bar.foreground
             onToggled: wiredRow.setMode(!wiredRow.manualMode)
             onHovered: function(hovered) {
@@ -2366,7 +2371,7 @@ Panel {
             text: wiredRow.busy
               ? "Applying…"
               : ((wiredRow.connected || wiredRow.hasCarrier) ? "Apply DHCP & connect" : "Save DHCP")
-            enabled: !wiredRow.busy
+            enabled: !wiredRow.busy && !root.wiredApplyBusy
             fontSize: Style.font.body
             foreground: root.bar.foreground
             fontFamily: root.bar.fontFamily
@@ -2407,7 +2412,7 @@ Panel {
             foreground: root.bar.foreground
             horizontalPadding: Style.spacing.controlGap
             verticalPadding: Style.spacing.controlPaddingY
-            enabled: !wiredRow.busy
+            enabled: !wiredRow.busy && !root.wiredApplyBusy
             text: wiredRow.draftAddress
             onTextChanged: {
               if (text !== wiredRow.draftAddress) {
@@ -2431,7 +2436,7 @@ Panel {
             foreground: root.bar.foreground
             horizontalPadding: Style.spacing.controlGap
             verticalPadding: Style.spacing.controlPaddingY
-            enabled: !wiredRow.busy
+            enabled: !wiredRow.busy && !root.wiredApplyBusy
             text: wiredRow.draftPrefix
             onTextChanged: {
               if (text !== wiredRow.draftPrefix) {
@@ -2502,7 +2507,7 @@ Panel {
             text: wiredRow.busy
               ? "Applying…"
               : ((wiredRow.connected || wiredRow.hasCarrier) ? "Apply & connect" : "Save")
-            enabled: !wiredRow.busy
+            enabled: !wiredRow.busy && !root.wiredApplyBusy
             fontSize: Style.font.body
             foreground: root.bar.foreground
             fontFamily: root.bar.fontFamily

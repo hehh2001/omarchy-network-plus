@@ -205,13 +205,16 @@ apply_connection() {
 }
 
 set_command() {
-  local dev=$1 mode=$2
+  local dev mode
   local profile ip prefix gateway dns
 
   if (($# < 2)); then
     echo "Usage: omarchy-network-eth-config set <device> <dhcp|manual> [ip] [prefix] [gateway] [dns]" >&2
     exit 2
   fi
+
+  dev=$1
+  mode=$2
 
   profile=$(ensure_profile "$dev")
   if [[ -z $profile ]]; then
