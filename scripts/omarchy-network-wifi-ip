@@ -1,0 +1,312 @@
+#!/bin/bash
+
+# User-owned helper for zzb.network:
+# Show and change the IPv4 configuration of the Wi-Fi network the machine is
+# connected to right now -- macOS' "Configure IPv4: Using DHCP / Manually" for
+# a Wi-Fi network.
+#
+# The setting is written into the NetworkManager profile for that network, so it
+# survives reconnects and reboots, and each network keeps its own choice. Only
+# the profile of the currently connected network is touched: switching back to
+# DHCP is always one Apply away, which matters because a wrong static address
+# still associates and then carries no traffic.
+
+# omarchy:summary=Show/configure IPv4 settings for the connected Wi-Fi network
+# omarchy:group=network
+# omarchy:args=[show | set <profile-uuid> <dhcp|manual> [ip] [prefix] [gateway] [dns]]
+
+set -euo pipefail
+export LC_ALL=C
+
+# nmcli -e no keeps ':' and '\' verbatim in values; -g asks for one field at a
+# time so values can never be confused with separators.
+nm_get() {
+  local field=$1
+  shift
+  nmcli -e no -g "$field" "$@" 2>/dev/null || true
+}
+
+device_state() {
+  local dev=$1
+  nmcli -e no -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: -v want="$dev" '
+    $1 == want { print $3; exit }
+  '
+}
+
+first_line() {
+  head -n 1
+}
+
+clean_dns() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+# The Wi-Fi device NetworkManager is connected on right now. An empty result
+# means there is no connected Wi-Fi network to configure.
+active_wifi_device() {
+  nmcli -e no -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: '
+    $2 == "wifi" && $3 ~ /^connected/ { print $1; exit }
+  '
+}
+
+# The device currently using this profile, if the network is the active one.
+device_for_uuid() {
+  local uuid=$1 dev type state
+  while IFS=: read -r dev type state; do
+    [[ $type == wifi ]] || continue
+    if [[ $(nm_get GENERAL.CON-UUID device show "$dev") == "$uuid" ]]; then
+      echo "$dev"
+      return 0
+    fi
+  done < <(nmcli -e no -t -f DEVICE,TYPE,STATE device status 2>/dev/null)
+  return 0
+}
+
+show_current() {
+  local dev uuid ssid state method addrs addr prefix gateway dns
+  local live_addr live_ip live_prefix live_gw
+
+  dev=$(active_wifi_device)
+  [[ -n $dev ]] || return 0
+
+  uuid=$(nm_get GENERAL.CON-UUID device show "$dev")
+  [[ -n $uuid && $uuid != "--" ]] || return 0
+
+  state=$(device_state "$dev")
+  state=${state%% *}
+  ssid=$(nm_get 802-11-wireless.ssid connection show uuid "$uuid")
+  method=$(nm_get ipv4.method connection show uuid "$uuid")
+  [[ -n $method ]] || method=auto
+
+  addr=""
+  prefix=""
+  gateway=""
+  dns=""
+
+  if [[ $method == manual ]]; then
+    addrs=$(nm_get ipv4.addresses connection show uuid "$uuid" | first_line)
+    if [[ -n $addrs ]]; then
+      if [[ $addrs == */* ]]; then
+        addr=${addrs%/*}
+        prefix=${addrs##*/}
+      else
+        addr=$addrs
+      fi
+    fi
+    gateway=$(nm_get ipv4.gateway connection show uuid "$uuid" | first_line)
+    dns=$(nm_get ipv4.dns connection show uuid "$uuid" | clean_dns)
+  fi
+
+  live_addr=$(nm_get IP4.ADDRESS device show "$dev" | first_line)
+  live_ip=${live_addr%%/*}
+  live_prefix=""
+  [[ $live_addr == */* ]] && live_prefix=${live_addr##*/}
+  live_gw=$(nm_get IP4.GATEWAY device show "$dev" | first_line)
+
+  printf 'device\t%s\n' "$dev"
+  printf 'uuid\t%s\n' "$uuid"
+  printf 'ssid\t%s\n' "$ssid"
+  printf 'state\t%s\n' "$state"
+  printf 'method\t%s\n' "$method"
+  printf 'address\t%s\n' "$addr"
+  printf 'prefix\t%s\n' "$prefix"
+  printf 'gateway\t%s\n' "$gateway"
+  printf 'dns\t%s\n' "$dns"
+  printf 'live_ip\t%s\n' "$live_ip"
+  printf 'live_prefix\t%s\n' "$live_prefix"
+  printf 'live_gateway\t%s\n' "$live_gw"
+}
+
+# True once NM has the requested IPv4 state on this network. Connectivity itself
+# is not the contract: a static address that is wrong still associates, and the
+# panel must report what actually happened rather than claim a success it cannot
+# see. For DHCP we also require a real lease, so an address left over from a
+# previous static configuration cannot pass as one.
+ipv4_state_matches() {
+  local uuid=$1 dev=$2 mode=$3 expected_ip=${4:-}
+  local state active addr dhcp
+
+  [[ -n $dev ]] || return 1
+  state=$(device_state "$dev")
+  [[ $state == connected* ]] || return 1
+  active=$(nm_get GENERAL.CON-UUID device show "$dev")
+  [[ $active == "$uuid" ]] || return 1
+
+  if [[ $mode == manual && -n $expected_ip ]]; then
+    addr=$(nm_get IP4.ADDRESS device show "$dev" | first_line)
+    [[ $addr == "$expected_ip"/* ]] || return 1
+  elif [[ $mode == dhcp ]]; then
+    addr=$(nm_get IP4.ADDRESS device show "$dev" | first_line)
+    dhcp=$(nm_get DHCP4.OPTION device show "$dev")
+    [[ -n $addr && $dhcp == *"ip_address ="* ]] || return 1
+  fi
+
+  return 0
+}
+
+apply_connection() {
+  local uuid=$1 mode=$2 old_mode=$3 expected_ip=${4:-}
+  local dev i
+
+  dev=$(device_for_uuid "$uuid")
+
+  # The saved network is not the one in use: writing the profile is the whole
+  # job, and it takes effect the next time this network is joined.
+  [[ -n $dev ]] || return 0
+
+  # An address change inside manual mode re-applies in place, so Wi-Fi stays
+  # associated. NM can report success before an async failure, so the requested
+  # address has to be seen on the device before this counts.
+  if [[ $mode == manual && $old_mode == manual ]]; then
+    if nmcli device reapply "$dev" >/dev/null 2>&1; then
+      for ((i = 0; i < 5; i++)); do
+        if ipv4_state_matches "$uuid" "$dev" "$mode" "$expected_ip"; then
+          return 0
+        fi
+        sleep 1
+      done
+    fi
+  fi
+
+  # Switching methods needs a clean reactivation: a DHCP -> manual (or the
+  # reverse) change applied on top of the running connection can leave the
+  # previous address active, which would look like an instant success while the
+  # old configuration was still in use. Only this network is cycled; other links
+  # stay up.
+  if [[ $(nm_get GENERAL.CON-UUID device show "$dev") == "$uuid" ]]; then
+    nmcli --wait 15 connection down uuid "$uuid" >/dev/null 2>&1 || true
+    for ((i = 0; i < 5; i++)); do
+      [[ $(nm_get GENERAL.CON-UUID device show "$dev") != "$uuid" ]] && break
+      sleep 1
+    done
+  fi
+
+  # A failure here is reported by NetworkManager itself (out of range, wrong
+  # credentials, ...) instead of being swallowed into a generic message. If the
+  # profile is somehow still active, the loop below still judges the end state.
+  if [[ $(nm_get GENERAL.CON-UUID device show "$dev") != "$uuid" ]]; then
+    if ! nmcli --wait 30 connection up uuid "$uuid" >/dev/null; then
+      echo "Error: NetworkManager could not activate the Wi-Fi network again." >&2
+      return 1
+    fi
+  fi
+
+  # Reassociating and then leasing takes longer than the wired path, so give it
+  # up to 20s. The device is re-resolved each round: a reconnect can land on a
+  # different Wi-Fi interface.
+  for ((i = 0; i < 20; i++)); do
+    dev=$(device_for_uuid "$uuid")
+    if ipv4_state_matches "$uuid" "$dev" "$mode" "$expected_ip"; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Error: NetworkManager activated the Wi-Fi network but the requested $mode IPv4 configuration did not take effect." >&2
+  return 1
+}
+
+set_command() {
+  local uuid mode
+  local type old_mode ip prefix gateway dns
+
+  if (($# < 2)); then
+    echo "Usage: omarchy-network-wifi-ip set <profile-uuid> <dhcp|manual> [ip] [prefix] [gateway] [dns]" >&2
+    exit 2
+  fi
+
+  uuid=$1
+  mode=$2
+
+  # Only Wi-Fi profiles are managed here; the wired helper owns the rest.
+  type=$(nm_get connection.type connection show uuid "$uuid")
+  if [[ $type != "802-11-wireless" ]]; then
+    echo "Error: '$uuid' is not a Wi-Fi connection profile." >&2
+    exit 1
+  fi
+
+  old_mode=$(nm_get ipv4.method connection show uuid "$uuid")
+
+  case $mode in
+    dhcp|auto)
+      nmcli connection modify uuid "$uuid" \
+        ipv4.method auto \
+        ipv4.addresses "" \
+        ipv4.gateway "" \
+        ipv4.dns "" \
+        ipv4.dns-search "" \
+        ipv4.ignore-auto-dns no \
+        >/dev/null
+      ;;
+
+    manual)
+      if (($# < 4)); then
+        echo "Usage: omarchy-network-wifi-ip set <profile-uuid> manual <ip> [prefix] [gateway] [dns]" >&2
+        exit 2
+      fi
+
+      ip=$3
+      prefix=${4:-24}
+      gateway=${5:-}
+      dns=${6:-}
+
+      if [[ -z $ip ]]; then
+        echo "Error: an IP address is required for manual configuration." >&2
+        exit 1
+      fi
+
+      if [[ -n $dns ]]; then
+        nmcli connection modify uuid "$uuid" \
+          ipv4.method manual \
+          ipv4.addresses "$ip/$prefix" \
+          ipv4.gateway "$gateway" \
+          ipv4.dns "$dns" \
+          ipv4.dns-search "" \
+          ipv4.ignore-auto-dns yes \
+          >/dev/null
+      else
+        nmcli connection modify uuid "$uuid" \
+          ipv4.method manual \
+          ipv4.addresses "$ip/$prefix" \
+          ipv4.gateway "$gateway" \
+          ipv4.dns "" \
+          ipv4.dns-search "" \
+          ipv4.ignore-auto-dns no \
+          >/dev/null
+      fi
+      ;;
+
+    *)
+      echo "Error: unknown mode '$mode' (expected dhcp or manual)." >&2
+      exit 2
+      ;;
+  esac
+
+  [[ $mode != auto ]] || mode=dhcp
+  apply_connection "$uuid" "$mode" "$old_mode" "${ip:-}"
+}
+
+usage() {
+  echo "Usage: omarchy-network-wifi-ip show" >&2
+  echo "       omarchy-network-wifi-ip set <profile-uuid> dhcp" >&2
+  echo "       omarchy-network-wifi-ip set <profile-uuid> manual <ip> [prefix] [gateway] [dns]" >&2
+}
+
+if (($# == 0)); then
+  usage
+  exit 2
+fi
+
+case $1 in
+  show)
+    show_current
+    ;;
+  set)
+    shift
+    set_command "$@"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

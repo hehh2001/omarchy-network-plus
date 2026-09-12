@@ -20,6 +20,11 @@ failure messages.
   section disappears instead of showing the last NIC that was seen.
 - Switch a wired NIC between **Auto DHCP** and **Manual static IPv4** from
   the bar panel.
+- The same choice for Wi-Fi, per network — macOS' "Configure IPv4: Using DHCP /
+  Manually". A **WI-FI IPV4** section appears while a Wi-Fi network is in use
+  and writes the static address, gateway and DNS into that network's
+  NetworkManager profile, so it survives reconnects and reboots, and every
+  network keeps its own settings.
 - Apply a static IP or DHCP change immediately through NetworkManager — no
   reboot required.
 - Cleanly reactivate only the selected NIC when switching between DHCP and
@@ -81,12 +86,15 @@ be placed in any bar section via `omarchy bar` or by editing
 
 ## Testing
 
-Both helpers ship with regression tests that stub `nmcli` and the kernel's
-network view, so they run anywhere:
+The helpers and the shared row logic ship with regression tests that stub
+`nmcli` (and the kernel's network view), so they run anywhere, need no
+privileges, and touch no real connection:
 
 ```bash
 bash tests/wired-nic-detection-test.sh   # which devices may appear as wired NICs
-bash tests/network-switch-test.sh        # DHCP <-> static transitions
+bash tests/network-switch-test.sh        # wired DHCP <-> static transitions
+bash tests/wifi-ipv4-test.sh             # Wi-Fi DHCP <-> static transitions
+bash tests/model-ipv4-test.sh            # the wording/state both rows derive
 ```
 
 ## License

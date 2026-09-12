@@ -25,9 +25,13 @@ Panel {
   readonly property string ethConfigScript: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/zzb.network/scripts/omarchy-network-eth-config"
 
-  // Plain-object rows returned by ethConfigScript list:
-  // { device, carrier, state, profile, method, address, prefix, gateway, dns,
-  //   liveIp, liveGateway }
+  // Helper for the connected Wi-Fi network's IPv4 settings. Same DHCP/static
+  // choice as the wired row, but per Wi-Fi profile instead of per NIC.
+  readonly property string wifiIpScript: Quickshell.env("HOME")
+    + "/.config/omarchy/plugins/zzb.network/scripts/omarchy-network-wifi-ip"
+
+  // Wired NIC rows from ethConfigScript list, normalized by Model.wiredNicRow
+  // into the shape Ipv4ConfigRow consumes.
   property var wiredDevices: []
   // The helper only returns real, attached hardware NICs (it drops unbacked
   // interfaces and the Apple T2 chip's always-present bridge Ethernet), so an
@@ -36,18 +40,21 @@ Panel {
   // adapter was unplugged from, and showing it would look like the panel kept
   // the last record it saw.
   readonly property bool hasWiredNics: wiredDevices.length > 0
-  // Set while a wired TextField has focus so the poller does not rebuild rows
-  // under the user's cursor.
-  property string editingWiredDevice: ""
-  // Devices whose wired mode/fields have uncommitted changes. The poller also
-  // skips these rows so a DHCP/static toggle does not vanish when the 3s list
-  // refresh rebuilds the model before the user has pressed Apply.
+  // Keys (wired device names) whose row has uncommitted mode/field changes or an
+  // open editor. Every wired refresh skips them so a DHCP/static toggle does not
+  // vanish when the 3s list refresh rebuilds the model before the user has
+  // pressed Apply.
   property var dirtyWiredDevices: []
-  // True while a wired NIC apply process is running. While it is, details
-  // polling freezes on the last good sample; otherwise the DHCP->static
+  // The connected Wi-Fi network's IPv4 settings, normalized by
+  // Model.wifiIpv4Row. Null while no Wi-Fi network is in use, which is what
+  // keeps the Wi-Fi IPv4 section hidden.
+  property var wifiIpv4: null
+  readonly property bool hasWifiIpv4: wifiIpv4 !== null
+  // True while an IPv4 apply process is running, wired or wireless. While it is,
+  // details polling freezes on the last good sample; otherwise a DHCP->static
   // transition would briefly publish the tailscale0 address from the status
-  // script's route fallback as the NIC drops out of the connected state.
-  property bool wiredApplyBusy: false
+  // script's route fallback as the link drops out of the connected state.
+  property bool ipv4ApplyBusy: false
 
   // Centralized close so callers can't forget to drop the passphrase prompt.
   function close() {
@@ -368,9 +375,9 @@ Panel {
       routerPingLatency = -1
       internetPingLatency = -1
       internetPingPacketLoss = 0
-      editingWiredDevice = ""
-      // Uncommitted wired drafts are panel-local: closing without Apply
-      // discards them, and the next open refreshes rows from NetworkManager.
+      // Uncommitted IPv4 drafts (wired rows and the Wi-Fi row) are panel-local:
+      // closing without Apply discards them, and the next open refreshes both
+      // from NetworkManager.
       dirtyWiredDevices = []
       setScannerEnabled(false)
     }
@@ -504,6 +511,10 @@ Panel {
       ethListProc.command = [root.ethConfigScript, "list"]
       ethListProc.running = true
     }
+    if (!wifiIpProc.running) {
+      wifiIpProc.command = [root.wifiIpScript, "show"]
+      wifiIpProc.running = true
+    }
     if (!bandProc.running) {
       bandProc.command = ["omarchy-network-band"]
       bandProc.running = true
@@ -520,10 +531,6 @@ Panel {
       }
     }
     syncWifiNetworks()
-  }
-
-  function wiredDirtyIndex(device) {
-    return root.dirtyWiredDevices.indexOf(device)
   }
 
   function setWiredDirty(device, dirty) {
@@ -548,6 +555,17 @@ Panel {
     }
   }
 
+  // The connected Wi-Fi network's IPv4 settings. A draft keeps the row frozen
+  // the same way the wired list does; an apply passes force=true because the
+  // profile it just rewrote has to replace the draft.
+  function refreshWifiIpv4(force) {
+    if (!force && (wifiIpv4Row.draftDirty || wifiIpv4Row.editing)) return
+    if (!wifiIpProc.running) {
+      wifiIpProc.command = [root.wifiIpScript, "show"]
+      wifiIpProc.running = true
+    }
+  }
+
   // Every refresh is authoritative about which NICs are attached, so panel-local
   // state for a NIC that just disappeared is dropped here. Without it a draft
   // left on an unplugged adapter would keep the poller paused (both refresh
@@ -556,7 +574,7 @@ Panel {
   function reconcileWiredState(rows) {
     var present = []
     var i
-    for (i = 0; i < rows.length; i++) present.push(rows[i].device)
+    for (i = 0; i < rows.length; i++) present.push(rows[i].key)
 
     var dirty = []
     for (i = 0; i < root.dirtyWiredDevices.length; i++) {
@@ -564,9 +582,6 @@ Panel {
       if (present.indexOf(device) >= 0) dirty.push(device)
     }
     if (dirty.length !== root.dirtyWiredDevices.length) root.dirtyWiredDevices = dirty
-
-    if (root.editingWiredDevice !== "" && present.indexOf(root.editingWiredDevice) < 0)
-      root.editingWiredDevice = ""
   }
 
   function updateWiredDevices(raw) {
@@ -577,7 +592,7 @@ Panel {
       if (!line) continue
       var p = line.split("\t")
       if (p.length < 11) continue
-      rows.push({
+      var row = Model.wiredNicRow({
         device: p[0],
         carrier: p[1] === "1",
         state: p[2],
@@ -590,9 +605,19 @@ Panel {
         liveIp: p[9],
         liveGateway: p[10]
       })
+      if (row) rows.push(row)
     }
     reconcileWiredState(rows)
     wiredDevices = rows
+  }
+
+  // `show` prints key/value lines for whichever Wi-Fi network is in use. While
+  // an apply is running the network drops out of NetworkManager for a moment,
+  // and dropping the row here would hide the section (and its progress) in the
+  // middle of the change the user asked for.
+  function updateWifiIpv4(raw) {
+    if (root.ipv4ApplyBusy) return
+    wifiIpv4 = Model.wifiIpv4Row(Model.parseKeyValue(raw))
   }
 
   function formatHeaderSpeed(mbps) {
@@ -617,11 +642,11 @@ Panel {
     // still reported, because nothing is in flight then.
     if (bandBusy && !next.iface) return
 
-    // Same for wired applies: the NIC can leave "connected" for a second or
-    // two while DHCP/static is switched, and without this freeze the status
-    // script could briefly publish the tailscale0 address in the IP row.
-    // Keep the last good sample until the apply process finishes and refreshes.
-    if (root.wiredApplyBusy) return
+    // Same for IPv4 applies, wired or wireless: the link can leave "connected"
+    // for a second or two while DHCP/static is switched, and without this freeze
+    // the status script could briefly publish the tailscale0 address in the IP
+    // row. Keep the last good sample until the apply finishes and refreshes.
+    if (root.ipv4ApplyBusy) return
 
     info = next
     updateThroughput(next)
@@ -952,6 +977,15 @@ Panel {
     }
   }
 
+  // Reads the IPv4 settings of the Wi-Fi network currently in use.
+  Process {
+    id: wifiIpProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.updateWifiIpv4(text)
+    }
+  }
+
   Timer {
     id: ethPoll
     interval: 3000
@@ -961,12 +995,22 @@ Panel {
       // Don't replace rows while a TextField has focus or a mode/field draft is
       // uncommitted; the row keeps the user's draft and the next manual
       // refresh/open or Apply catches status changes.
-      if (root.editingWiredDevice !== "") return
       if (root.dirtyWiredDevices.length > 0) return
       if (ethListProc.running) return
       ethListProc.command = [root.ethConfigScript, "list"]
       ethListProc.running = true
     }
+  }
+
+  Timer {
+    id: wifiIpPoll
+    interval: 3000
+    repeat: true
+    // Runs for as long as the panel is open, not only while a network is
+    // reported: a Wi-Fi reactivation drops the connection for a few seconds, and
+    // a poller that stopped with it would never bring the section back.
+    running: root.opened
+    onTriggered: root.refreshWifiIpv4(false)
   }
 
   Timer {
@@ -1427,13 +1471,63 @@ Panel {
             width: parent.width
             height: wiredNic.implicitHeight
 
-            WiredNicRow {
+            Ipv4ConfigRow {
               id: wiredNic
               width: parent.width
               info: modelData
-              rowIndex: index
+              script: root.ethConfigScript
+              bar: root.bar
+              applyBusy: root.ipv4ApplyBusy
+              onApplyStarted: root.ipv4ApplyBusy = true
+              onApplyFinished: root.ipv4ApplyBusy = false
+              onDraftStateChanged: root.setWiredDirty(wiredNic.info.key, wiredNic.draftDirty || wiredNic.editing)
+              onApplied: {
+                root.refreshWiredDevices(true)
+                root.refresh()
+              }
+              onHovered: root.cursorActive = false
             }
           }
+        }
+      }
+
+      // Wi-Fi IPv4 settings for the network in use. macOS calls the same choice
+      // "Configure IPv4: Using DHCP / Manually"; here it lives in the
+      // NetworkManager profile for that network, so it survives reconnects and
+      // every network keeps its own. Only the connected network is offered:
+      // with no Wi-Fi network in use there is nothing to apply a change to.
+      PanelSeparator {
+        visible: root.hasWifiIpv4
+        foreground: root.bar.foreground
+      }
+
+      Column {
+        visible: root.hasWifiIpv4
+        width: parent.width
+        spacing: Style.space(10)
+
+        PanelSectionHeader {
+          text: "WI-FI IPV4"
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+        }
+
+        Ipv4ConfigRow {
+          id: wifiIpv4Row
+          width: parent.width
+          info: root.wifiIpv4 !== null ? root.wifiIpv4 : ({})
+          script: root.wifiIpScript
+          bar: root.bar
+          applyBusy: root.ipv4ApplyBusy
+          onApplyStarted: root.ipv4ApplyBusy = true
+          onApplyFinished: root.ipv4ApplyBusy = false
+          onApplied: {
+            // force=true: the apply just rewrote this network's profile, so the
+            // fresh state has to replace the draft.
+            root.refreshWifiIpv4(true)
+            root.refresh()
+          }
+          onHovered: root.cursorActive = false
         }
       }
 
@@ -2097,491 +2191,6 @@ Panel {
         foreground: root.bar.foreground
         fontFamily: root.bar.fontFamily
         onClicked: row.submitCredentials()
-      }
-    }
-  }
-
-
-  // One NetworkManager-managed wired NIC row. The header always shows the
-  // adapter; the mode switch toggles between automatic DHCP and a manual
-  // static IPv4 form that is applied straight through nmcli.
-  component WiredNicRow: Item {
-    id: wiredRow
-    required property var info
-    required property int rowIndex
-
-    readonly property bool connected: info.state === "connected"
-    readonly property bool connecting: info.state === "connecting"
-    readonly property bool hasCarrier: info.carrier
-    readonly property bool manualSaved: info.method === "manual"
-    readonly property string liveAddressText: {
-      var raw = String(info.liveIp || "")
-      var idx = raw.indexOf("/")
-      return idx < 0 ? raw : raw.substring(0, idx)
-    }
-    readonly property string livePrefixText: {
-      var raw = String(info.liveIp || "")
-      var idx = raw.indexOf("/")
-      return idx < 0 ? "" : raw.substring(idx + 1)
-    }
-    readonly property string stateText: {
-      if (info.state === "connected") return "Connected"
-      if (info.state === "connecting") return "Connecting"
-      if (info.state === "unavailable") return "No cable"
-      if (info.state === "disconnected") return hasCarrier ? "Cable present" : "Disconnected"
-      if (info.state) return info.state.charAt(0).toUpperCase() + info.state.slice(1)
-      return "Unknown"
-    }
-    readonly property string summaryText: {
-      var parts = []
-      parts.push(stateText)
-      if (liveAddressText !== "") parts.push(liveAddressText + (livePrefixText !== "" ? "/" + livePrefixText : ""))
-      if (info.profile) parts.push(info.profile)
-      if (statusText !== "") parts.push(statusText)
-      return parts.join(" · ")
-    }
-
-    property bool manualMode: manualSaved
-    readonly property bool modeDirty: manualMode !== manualSaved
-    // Local copy of "the user touched the mode switch". modeDirty can in
-    // principle become false if a background list refresh updates info.method
-    // before the row has been reloaded; this flag keeps the staged DHCP Apply
-    // button visible until load/reset/apply explicitly clears it.
-    property bool modeEdited: false
-    property string draftAddress: info.address || ""
-    property string draftPrefix: info.prefix || ""
-    property string draftGateway: info.gateway || ""
-    property string draftDns: info.dns || ""
-    property bool busy: false
-    property string statusText: ""
-    property bool failed: false
-    property string initializedDevice: ""
-
-    function loadFromInfo() {
-      if (!info.device) return
-      initializedDevice = info.device
-      manualMode = info.method === "manual"
-      modeEdited = false
-      draftAddress = info.address || ""
-      draftPrefix = info.prefix || ""
-      draftGateway = info.gateway || ""
-      draftDns = info.dns || ""
-      busy = false
-      statusText = ""
-      failed = false
-      root.setWiredDirty(info.device, false)
-    }
-
-    // Only initializes once per row incarnation. Later info updates must not
-    // clobber drafts while the user is working on this row.
-    function initFromInfo() {
-      if (initializedDevice === info.device) return
-      loadFromInfo()
-    }
-
-    // Reset/Cancel: restore every draft from the saved NetworkManager profile,
-    // regardless of whether this row was initialized before.
-    function resetToInfo() {
-      loadFromInfo()
-    }
-
-    function markDirty() {
-      root.setWiredDirty(info.device, true)
-    }
-
-    function setMode(nextManual) {
-      if (busy) return
-      manualMode = nextManual
-      statusText = ""
-      failed = false
-
-      if (manualMode) {
-        if (draftAddress === "") {
-          if (liveAddressText !== "") {
-            draftAddress = liveAddressText
-            if (livePrefixText !== "") draftPrefix = livePrefixText
-          }
-        }
-        if (draftPrefix === "") draftPrefix = "24"
-      }
-      modeEdited = manualMode !== manualSaved
-      root.setWiredDirty(info.device, modeEdited)
-    }
-
-    function validIpv4(value) {
-      var text = String(value || "").trim()
-      if (!text) return false
-      var parts = text.split(".")
-      if (parts.length !== 4) return false
-      for (var i = 0; i < parts.length; i++) {
-        var part = parts[i]
-        if (!/^\d{1,3}$/.test(part)) return false
-        var n = parseInt(part, 10)
-        if (n < 0 || n > 255) return false
-      }
-      return true
-    }
-
-    function validPrefix(value) {
-      var text = String(value || "").trim()
-      if (!/^\d{1,2}$/.test(text)) return false
-      var n = parseInt(text, 10)
-      return n >= 0 && n <= 32
-    }
-
-    function validDns(value) {
-      var text = String(value || "").trim()
-      if (text === "") return true
-      var tokens = text.split(/[\s,]+/)
-      for (var i = 0; i < tokens.length; i++) {
-        if (!validIpv4(tokens[i])) return false
-      }
-      return true
-    }
-
-    function applyConfig() {
-      // Serialize wired reconfiguration. wiredApplyBusy is panel-wide because
-      // NetworkManager activations can overlap across rows, and clearing it
-      // when the first of two concurrent applies exits would resume details
-      // polling while the second NIC is still transitioning.
-      if (busy || root.wiredApplyBusy || !info.device) return
-      statusText = ""
-      failed = false
-
-      if (manualMode) {
-        if (!validIpv4(draftAddress)) {
-          statusText = "Invalid IP address"
-          failed = true
-          return
-        }
-        if (!validPrefix(draftPrefix)) {
-          statusText = "Invalid prefix (0-32)"
-          failed = true
-          return
-        }
-        if (String(draftGateway || "").trim() !== "" && !validIpv4(draftGateway)) {
-          statusText = "Invalid gateway"
-          failed = true
-          return
-        }
-        if (!validDns(draftDns)) {
-          statusText = "Invalid DNS server"
-          failed = true
-          return
-        }
-      }
-
-      busy = true
-      statusText = connected
-        ? "Applying…"
-        : (hasCarrier ? "Applying and connecting…" : "Saving…")
-      root.wiredApplyBusy = true
-
-      var args = [root.ethConfigScript, "set", info.device]
-      if (!manualMode) {
-        args.push("dhcp")
-      } else {
-        var prefix = String(draftPrefix || "").trim() || "24"
-        args.push("manual")
-        args.push(String(draftAddress || "").trim())
-        args.push(prefix)
-        args.push(String(draftGateway || "").trim())
-        args.push(String(draftDns || "").trim())
-      }
-      ethApplyProc.command = args
-      ethApplyProc.running = true
-    }
-
-    onInfoChanged: initFromInfo()
-    Component.onCompleted: initFromInfo()
-    Component.onDestruction: {
-      // If a model refresh destroys the row while its apply process is still
-      // running, never leave the details poll frozen by a stale busy flag.
-      if (busy) root.wiredApplyBusy = false
-    }
-
-    implicitHeight: contentColumn.implicitHeight
-
-    Column {
-      id: contentColumn
-      width: parent.width
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.top: parent.top
-      spacing: Style.space(6)
-
-      // Header: interface + state on the left, DHCP/manual switch on the right.
-      Item {
-        width: parent.width
-        implicitHeight: Math.max(headerLabels.implicitHeight, modeSwitchGroup.implicitHeight)
-
-        Row {
-          id: modeSwitchGroup
-          spacing: Style.space(6)
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-
-          Text {
-            text: wiredRow.manualMode ? "MANUAL" : "AUTO DHCP"
-            color: Qt.darker(root.bar.foreground, 1.4)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 1.0
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          ToggleSwitch {
-            checked: !wiredRow.manualMode
-            enabled: !wiredRow.busy && !root.wiredApplyBusy
-            foreground: root.bar.foreground
-            onToggled: wiredRow.setMode(!wiredRow.manualMode)
-            onHovered: function(hovered) {
-              if (hovered) root.cursorActive = false
-            }
-          }
-        }
-
-        Column {
-          id: headerLabels
-          anchors.left: parent.left
-          anchors.right: modeSwitchGroup.left
-          anchors.rightMargin: Style.space(12)
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(1)
-
-          Text {
-            width: parent.width
-            text: wiredRow.info.device
-            color: (wiredRow.connected || wiredRow.hasCarrier)
-              ? root.bar.foreground
-              : Qt.darker(root.bar.foreground, 1.4)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.body
-            font.bold: wiredRow.connected || wiredRow.hasCarrier
-            elide: Text.ElideRight
-          }
-
-          Text {
-            width: parent.width
-            text: wiredRow.summaryText
-            color: wiredRow.failed
-              ? root.bar.urgent
-              : Qt.darker(root.bar.foreground, 1.4)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
-        }
-      }
-
-      // Auto DHCP is the default; no form is needed. When the saved profile is
-      // still manual, toggling the switch only stages the change -- it must be
-      // committed with the Apply button below, exactly like editing a static IP.
-      Column {
-        visible: !wiredRow.manualMode
-        width: parent.width
-        spacing: Style.space(6)
-
-        Text {
-          width: parent.width
-          text: "DHCP — obtain IP, gateway and DNS automatically."
-          color: Qt.darker(root.bar.foreground, 1.6)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
-
-        Row {
-          visible: wiredRow.modeDirty || wiredRow.modeEdited
-          spacing: Style.space(6)
-
-          Button {
-            text: wiredRow.busy
-              ? "Applying…"
-              : ((wiredRow.connected || wiredRow.hasCarrier) ? "Apply DHCP & connect" : "Save DHCP")
-            enabled: !wiredRow.busy && !root.wiredApplyBusy
-            fontSize: Style.font.body
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY
-            onClicked: wiredRow.applyConfig()
-          }
-
-          Button {
-            text: "Reset"
-            visible: !wiredRow.busy
-            fontSize: Style.font.body
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY
-            onClicked: wiredRow.resetToInfo()
-          }
-        }
-      }
-
-      // Static IPv4 form.
-      Column {
-        visible: wiredRow.manualMode
-        width: parent.width
-        spacing: Style.space(6)
-
-        RowLayout {
-          width: parent.width
-          spacing: Style.space(6)
-
-          TextField {
-            id: ipField
-            Layout.fillWidth: true
-            placeholderText: "IP address"
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            foreground: root.bar.foreground
-            horizontalPadding: Style.spacing.controlGap
-            verticalPadding: Style.spacing.controlPaddingY
-            enabled: !wiredRow.busy && !root.wiredApplyBusy
-            text: wiredRow.draftAddress
-            onTextChanged: {
-              if (text !== wiredRow.draftAddress) {
-                wiredRow.draftAddress = text
-                wiredRow.markDirty()
-              }
-            }
-            onActiveFocusChanged: {
-              if (activeFocus) root.editingWiredDevice = wiredRow.info.device
-              else if (root.editingWiredDevice === wiredRow.info.device) root.editingWiredDevice = ""
-            }
-            onAccepted: prefixField.forceActiveFocus()
-          }
-
-          TextField {
-            id: prefixField
-            Layout.preferredWidth: Style.space(72)
-            placeholderText: "/24"
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            foreground: root.bar.foreground
-            horizontalPadding: Style.spacing.controlGap
-            verticalPadding: Style.spacing.controlPaddingY
-            enabled: !wiredRow.busy && !root.wiredApplyBusy
-            text: wiredRow.draftPrefix
-            onTextChanged: {
-              if (text !== wiredRow.draftPrefix) {
-                wiredRow.draftPrefix = text
-                wiredRow.markDirty()
-              }
-            }
-            onActiveFocusChanged: {
-              if (activeFocus) root.editingWiredDevice = wiredRow.info.device
-              else if (root.editingWiredDevice === wiredRow.info.device) root.editingWiredDevice = ""
-            }
-            onAccepted: gatewayField.forceActiveFocus()
-          }
-        }
-
-        TextField {
-          id: gatewayField
-          width: parent.width
-          placeholderText: "Gateway (optional)"
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          foreground: root.bar.foreground
-          horizontalPadding: Style.spacing.controlGap
-          verticalPadding: Style.spacing.controlPaddingY
-          enabled: !wiredRow.busy
-          text: wiredRow.draftGateway
-          onTextChanged: {
-            if (text !== wiredRow.draftGateway) {
-              wiredRow.draftGateway = text
-              wiredRow.markDirty()
-            }
-          }
-          onActiveFocusChanged: {
-            if (activeFocus) root.editingWiredDevice = wiredRow.info.device
-            else if (root.editingWiredDevice === wiredRow.info.device) root.editingWiredDevice = ""
-          }
-          onAccepted: dnsField.forceActiveFocus()
-        }
-
-        TextField {
-          id: dnsField
-          width: parent.width
-          placeholderText: "DNS servers (optional, comma or space separated)"
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          foreground: root.bar.foreground
-          horizontalPadding: Style.spacing.controlGap
-          verticalPadding: Style.spacing.controlPaddingY
-          enabled: !wiredRow.busy
-          text: wiredRow.draftDns
-          onTextChanged: {
-            if (text !== wiredRow.draftDns) {
-              wiredRow.draftDns = text
-              wiredRow.markDirty()
-            }
-          }
-          onActiveFocusChanged: {
-            if (activeFocus) root.editingWiredDevice = wiredRow.info.device
-            else if (root.editingWiredDevice === wiredRow.info.device) root.editingWiredDevice = ""
-          }
-          onAccepted: wiredRow.applyConfig()
-        }
-
-        Row {
-          spacing: Style.space(6)
-
-          Button {
-            text: wiredRow.busy
-              ? "Applying…"
-              : ((wiredRow.connected || wiredRow.hasCarrier) ? "Apply & connect" : "Save")
-            enabled: !wiredRow.busy && !root.wiredApplyBusy
-            fontSize: Style.font.body
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY
-            onClicked: wiredRow.applyConfig()
-          }
-
-          Button {
-            text: "Reset"
-            visible: !wiredRow.busy
-            fontSize: Style.font.body
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY
-            onClicked: wiredRow.resetToInfo()
-          }
-        }
-      }
-    }
-
-    Process {
-      id: ethApplyProc
-      stdout: StdioCollector { id: ethApplyOut; waitForEnd: true }
-      stderr: StdioCollector { id: ethApplyErr; waitForEnd: true }
-      onExited: function(exitCode) {
-        wiredRow.busy = false
-        root.wiredApplyBusy = false
-        if (exitCode === 0) {
-          wiredRow.failed = false
-          wiredRow.statusText = wiredRow.hasCarrier ? "Applied" : "Saved"
-          // force=true: the apply just changed the saved NM profile, so this
-          // refresh must replace the dirty row with the new authoritative state.
-          // Clearing initializedDevice also lets a surviving delegate reload on
-          // the next info update instead of staying stuck on its old draft.
-          wiredRow.initializedDevice = ""
-          root.refreshWiredDevices(true)
-          root.refresh()
-        } else {
-          wiredRow.failed = true
-          var firstLine = String(ethApplyErr.text || "").trim().split("\n")[0]
-          wiredRow.statusText = firstLine !== "" ? "Failed: " + firstLine : "Apply failed"
-        }
-        if (root.editingWiredDevice === wiredRow.info.device) root.editingWiredDevice = ""
       }
     }
   }

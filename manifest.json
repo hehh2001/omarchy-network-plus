@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "zzb.network",
   "name": "My Network",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "author": "hehh2001",
   "license": "MIT",
-  "description": "Enhanced Omarchy network widget: Wi-Fi list plus wired NIC DHCP/static IPv4 management.",
+  "description": "Enhanced Omarchy network widget: Wi-Fi list plus per-network Wi-Fi and wired NIC DHCP/static IPv4 management.",
   "kinds": [
     "bar-widget"
   ],

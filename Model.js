@@ -363,6 +363,109 @@ function shouldRepromptPassphrase(reason, needsCredentials, reasons) {
   return reason === r.NoSecrets || reason === r.WifiAuthTimeout
 }
 
+// --- IPv4 configuration rows -------------------------------------------------
+// A wired NIC and the connected Wi-Fi network are configured through the same
+// row, so the wording and the derived state live here instead of in the QML:
+// wired rows answer to carrier, wireless rows only exist while the network is
+// connected. Both builders return null when there is nothing to configure.
+
+function ipv4StateText(state, linkPresent, wireless) {
+  if (state === "connected") return "Connected"
+  if (state === "connecting") return "Connecting"
+
+  if (wireless) {
+    if (state === "disconnected") return "Not connected"
+    if (state) return state.charAt(0).toUpperCase() + state.slice(1)
+    return "Unknown"
+  }
+
+  if (state === "unavailable") return "No cable"
+  if (state === "disconnected") return linkPresent ? "Cable present" : "Disconnected"
+  if (state) return state.charAt(0).toUpperCase() + state.slice(1)
+  return "Unknown"
+}
+
+function ipv4DhcpButtonText(connected, linkPresent, wireless) {
+  if (wireless) return connected ? "Apply DHCP & reconnect" : "Save DHCP"
+  return (connected || linkPresent) ? "Apply DHCP & connect" : "Save DHCP"
+}
+
+function ipv4ApplyingText(connected, linkPresent, wireless) {
+  if (connected) return "Applying…"
+  if (wireless) return "Saving…"
+  return linkPresent ? "Applying and connecting…" : "Saving…"
+}
+
+// "Saved" is the honest word when nothing is up to apply it to: the profile is
+// written and takes effect on the next connect.
+function ipv4AppliedText(connected, linkPresent, wireless) {
+  return (wireless ? connected : linkPresent) ? "Applied" : "Saved"
+}
+
+function wiredNicRow(raw) {
+  var row = raw || {}
+  if (!row.device) return null
+
+  var carrier = !!row.carrier
+  var connected = row.state === "connected"
+
+  return {
+    key: row.device,
+    name: row.device,
+    kind: "wired",
+    device: row.device,
+    state: row.state || "",
+    connected: connected,
+    linkPresent: carrier,
+    stateText: ipv4StateText(row.state, carrier, false),
+    dhcpButtonText: ipv4DhcpButtonText(connected, carrier, false),
+    applyingText: ipv4ApplyingText(connected, carrier, false),
+    appliedText: ipv4AppliedText(connected, carrier, false),
+    profile: row.profile || "",
+    method: row.method || "auto",
+    address: row.address || "",
+    prefix: row.prefix || "",
+    gateway: row.gateway || "",
+    dns: row.dns || "",
+    liveIp: row.liveIp || "",
+    liveGateway: row.liveGateway || ""
+  }
+}
+
+// `fields` is the key/value output of scripts/omarchy-network-wifi-ip show.
+function wifiIpv4Row(fields) {
+  var row = fields || {}
+  if (!row.uuid) return null
+
+  var connected = row.state === "connected"
+  var live = String(row.live_ip || "")
+  if (live !== "" && String(row.live_prefix || "") !== "") live += "/" + row.live_prefix
+
+  return {
+    key: row.uuid,
+    name: row.ssid || row.device || row.uuid,
+    kind: "wifi",
+    device: row.device || "",
+    state: row.state || "",
+    connected: connected,
+    // Wi-Fi has no cable to miss: the network is either the active one or it is
+    // not offered at all.
+    linkPresent: true,
+    stateText: ipv4StateText(row.state, true, true),
+    dhcpButtonText: ipv4DhcpButtonText(connected, true, true),
+    applyingText: ipv4ApplyingText(connected, true, true),
+    appliedText: ipv4AppliedText(connected, true, true),
+    profile: row.ssid || "",
+    method: row.method || "auto",
+    address: row.address || "",
+    prefix: row.prefix || "",
+    gateway: row.gateway || "",
+    dns: row.dns || "",
+    liveIp: live,
+    liveGateway: row.live_gateway || ""
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseNetworkStatus: parseNetworkStatus,
@@ -384,6 +487,12 @@ if (typeof module !== "undefined") {
     formatBytes: formatBytes,
     formatRate: formatRate,
     formatPingLatency: formatPingLatency,
+    ipv4StateText: ipv4StateText,
+    ipv4DhcpButtonText: ipv4DhcpButtonText,
+    ipv4ApplyingText: ipv4ApplyingText,
+    ipv4AppliedText: ipv4AppliedText,
+    wiredNicRow: wiredNicRow,
+    wifiIpv4Row: wifiIpv4Row,
     wifiRow: wifiRow,
     sortWifiRows: sortWifiRows,
     wifiSectionTitle: wifiSectionTitle,
