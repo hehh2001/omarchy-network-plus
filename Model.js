@@ -261,6 +261,43 @@ function formatPingLatency(ms, hasSamples) {
   return value.toFixed(value > 0 && value < 10 ? 1 : 0) + " ms"
 }
 
+// --- Public (egress) address ------------------------------------------------
+// scripts/omarchy-network-public-ip prints the bare address, but the value is
+// formatted here so a failed lookup can never be mistaken for one: the row has
+// to read "--"/"Checking…"/"Unavailable" rather than adopt whatever a captive
+// portal or an error path happened to write on stdout.
+
+// The bare dotted quad, or "" when the text is not one. Leading zeroes are
+// tolerated (they are still the same octet) but anything that is not four
+// in-range decimal octets -- an error page, a blank answer, an IPv6 address --
+// is rejected.
+function publicIpAddress(raw) {
+  var text = String(raw || "").replace(/\r?\n+$/, "").trim()
+  var parts = text.split(".")
+
+  if (parts.length !== 4) return ""
+
+  for (var i = 0; i < parts.length; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return ""
+    if (parseInt(parts[i], 10) > 255) return ""
+  }
+
+  return text
+}
+
+// The value the details grid renders. An address always wins, so the row keeps
+// showing what it knows while a later re-check is in flight. Without one,
+// "Checking…" is a lookup in progress, "Unavailable" is a lookup that came
+// back empty, and "--" is a lookup that has not run yet -- the same placeholder
+// the ping and transfer rows use while they wait for their first sample.
+function publicIpText(address, busy, failed) {
+  var value = publicIpAddress(address)
+  if (value !== "") return value
+  if (busy) return "Checking…"
+  if (failed) return "Unavailable"
+  return "--"
+}
+
 function wifiRow(network) {
   if (!network) return null
   // Primitives only: rows become list-model data, so a WifiNetwork here puts a
@@ -487,6 +524,8 @@ if (typeof module !== "undefined") {
     formatBytes: formatBytes,
     formatRate: formatRate,
     formatPingLatency: formatPingLatency,
+    publicIpAddress: publicIpAddress,
+    publicIpText: publicIpText,
     ipv4StateText: ipv4StateText,
     ipv4DhcpButtonText: ipv4DhcpButtonText,
     ipv4ApplyingText: ipv4ApplyingText,

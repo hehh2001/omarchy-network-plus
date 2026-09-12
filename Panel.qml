@@ -30,6 +30,10 @@ Panel {
   readonly property string wifiIpScript: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/zzb.network/scripts/omarchy-network-wifi-ip"
 
+  // Helper for the public (egress) address the internet sees this machine as.
+  readonly property string publicIpScript: Quickshell.env("HOME")
+    + "/.config/omarchy/plugins/zzb.network/scripts/omarchy-network-public-ip"
+
   // Wired NIC rows from ethConfigScript list, normalized by Model.wiredNicRow
   // into the shape Ipv4ConfigRow consumes.
   property var wiredDevices: []
@@ -71,6 +75,19 @@ Panel {
   // Live connection details from `ip` / /sys / iw.
   property var info: ({})  // { iface, type, ip, prefix, gateway, speed, duplex, ssid, signal, freq, bitrate, rx_bytes, tx_bytes, router_ping_ms, internet_ping_ms }
 
+  // Public (egress) address as the internet sees this machine. It rides the
+  // default route, so with a Tailscale exit node (or any other tunnel) in force
+  // it is the exit's address rather than the one the local link was handed --
+  // the two only differ when something in between rewrites the source, which is
+  // exactly what this row is for. Empty until a lookup answers.
+  property string publicIp: ""
+  property bool publicIpBusy: false
+  property bool publicIpFailed: false
+  // The interface the last lookup was about. The details poll re-reports the
+  // same link every 1.5s, so watching `info` for a *change* of this value is
+  // what keeps a real link change from being confused with a re-report.
+  property string publicIpIface: ""
+
   // Throughput tracking. Rates are computed as deltas between successive
   // `omarchy-network-status --verbose` samples (~1.5s apart via detailsPoll).
   // We hold "prev" alongside a timestamp so the first sample after open or
@@ -90,6 +107,16 @@ Panel {
   readonly property int pingHistoryWindow: 24
   readonly property int pingAverageWindow: 5
   readonly property bool hasInternetPing: internetPingSamples.length > 0
+  // The gateway probe has been collected and averaged since before this panel
+  // displayed it, so the router row rides the same "no sample yet" contract as
+  // the internet row: mounted, holding its place, reading "--" until a probe
+  // lands. An actual timeout is a different answer and still says "Timeout".
+  readonly property bool hasRouterPing: routerPingSamples.length > 0
+  // Public IP row state. A real address always wins, so a re-check in flight
+  // never blanks a value the panel already has; see Model.publicIpText for the
+  // rest of the ladder ("Checking…" / "Unavailable" / "--").
+  readonly property string publicIpDisplay: Model.publicIpText(publicIp, publicIpBusy, publicIpFailed)
+  readonly property bool publicIpUnavailable: publicIpDisplay === "Unavailable"
   // Every stat row stays mounted whether or not there is data behind it, so a
   // sample arriving late never reflows the grid. This says whether the numbers
   // are real yet or the row should read "--".
@@ -142,6 +169,24 @@ Panel {
   property string hiddenPassword: ""
   property string hiddenStatus: ""
   property bool hiddenBusy: false
+
+  // Keys of the inline editors that currently hold the keyboard -- the
+  // hidden-network fields, the Wi-Fi IPv4 row, the wired rows' address fields.
+  // The panel's key dispatcher runs with Keys.BeforeItem priority, so an editor
+  // that is not announced here is typed into *and* acted on: "w" would switch
+  // the radio off while it is being typed into an SSID, "r" would refresh the
+  // panel, and space, Enter and j/k/h/l would never reach the field at all.
+  //
+  // Two sets, because the two kinds have different lifetimes. The panel's own
+  // editors exist for as long as the panel does, so their focus transitions are
+  // the whole story. A wired row's fields live in a Repeater delegate that any
+  // refresh replaces, and a delegate that is gone cannot report the focus it
+  // held -- so the wired set is dropped wholesale when the row list is rebuilt,
+  // which is exactly the moment those fields cease to exist.
+  property var panelEditorsFocused: []
+  property var wiredEditorsFocused: []
+  readonly property bool inlineEditorFocused: panelEditorsFocused.length > 0
+    || wiredEditorsFocused.length > 0
 
   // ConnectionFailReason values as a plain object, so Model.js helpers stay
   // pure JS and Node-testable.
@@ -354,6 +399,10 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       refresh(true)
+      // The egress address is not trusted to have survived the time the panel
+      // spent closed -- the tunnel, the network or the provider can all have
+      // moved -- so the open is one of the moments it is re-asked.
+      refreshPublicIp()
       selectedIndex = wifiNetworks.length > 0 ? 0 : -1
       wifiActionFocused = false
       focusSection = wifiNetworks.length > 0 ? "wifi" : "header"
@@ -377,8 +426,15 @@ Panel {
       internetPingPacketLoss = 0
       // Uncommitted IPv4 drafts (wired rows and the Wi-Fi row) are panel-local:
       // closing without Apply discards them, and the next open refreshes both
-      // from NetworkManager.
+      // from NetworkManager. The wired rows are rebuilt on the next open, but
+      // the Wi-Fi row is one long-lived instance and has to be told.
       dirtyWiredDevices = []
+      wifiIpv4Row.discardDraft()
+      // Every editor goes down with the panel, and no reliable focus-out is
+      // guaranteed for a field whose window was unmapped -- so drop both sets
+      // rather than trusting the last report.
+      panelEditorsFocused = []
+      wiredEditorsFocused = []
       setScannerEnabled(false)
     }
   }
@@ -507,14 +563,15 @@ Panel {
   function refresh(scanWifi) {
     if (scanWifi === undefined) scanWifi = false
     if (!detailsProc.running) detailsProc.running = true
-    if (!ethListProc.running) {
-      ethListProc.command = [root.ethConfigScript, "list"]
-      ethListProc.running = true
-    }
-    if (!wifiIpProc.running) {
-      wifiIpProc.command = [root.wifiIpScript, "show"]
-      wifiIpProc.running = true
-    }
+    // Both IPv4 helpers are reached through their guarded entry points instead
+    // of the list processes being restarted here. This function is called by
+    // the "r"/"w" shortcuts and by every finished Wi-Fi action, and an
+    // unconditional re-list rebuilds the wired Repeater's delegates -- which
+    // discards an uncommitted DHCP/static toggle or a half-typed static
+    // address. A caller that really has to replace a draft (the apply that
+    // just rewrote the profile) asks for it with force=true.
+    refreshWiredDevices(false)
+    refreshWifiIpv4(false)
     if (!bandProc.running) {
       bandProc.command = ["omarchy-network-band"]
       bandProc.running = true
@@ -541,6 +598,49 @@ Panel {
     if (dirty && !present) arr.push(device)
     else if (!dirty && present) arr.splice(idx, 1)
     root.dirtyWiredDevices = arr
+  }
+
+  // Editor focus, collected the way dirtyWiredDevices is collected, so a row can
+  // report itself without the panel reaching into it.
+  function toggleFocusedKey(keys, key, focused) {
+    if (!key) return keys
+    var arr = keys.slice()
+    var idx = arr.indexOf(key)
+    var present = idx >= 0
+    if (focused && !present) arr.push(key)
+    else if (!focused && present) arr.splice(idx, 1)
+    return arr
+  }
+
+  function setPanelEditorFocused(key, focused) {
+    panelEditorsFocused = toggleFocusedKey(panelEditorsFocused, key, focused)
+  }
+
+  function setWiredEditorFocused(device, focused) {
+    wiredEditorsFocused = toggleFocusedKey(wiredEditorsFocused, device, focused)
+  }
+
+  // One HTTPS request per run, so the policy lives here: on open, whenever the
+  // active interface changes, and on a slow tick. A link that is mid-change is
+  // skipped -- the answer then would describe the link that is going away --
+  // and the next tick (or the refresh the change itself triggers) picks it up.
+  function refreshPublicIp() {
+    if (!root.opened) return
+    if (root.ipv4ApplyBusy || root.bandBusy) return
+    if (publicIpProc.running) return
+    root.publicIpBusy = true
+    root.publicIpFailed = false
+    publicIpProc.running = true
+  }
+
+  // Only a bare in-range address is accepted: a captive portal answers with an
+  // HTML login page, and printing that as the address would be worse than
+  // printing that the lookup failed.
+  function updatePublicIp(raw) {
+    var address = Model.publicIpAddress(raw)
+    if (address === "") return
+    publicIp = address
+    publicIpFailed = false
   }
 
   function refreshWiredDevices(force) {
@@ -608,6 +708,11 @@ Panel {
       if (row) rows.push(row)
     }
     reconcileWiredState(rows)
+    // Assigning the model rebuilds every delegate, so no wired field survives
+    // with the focus it reported -- and a row that is gone cannot report losing
+    // it. Clearing here is what keeps a disposed row from leaving the panel's
+    // key dispatcher blocked for the rest of the session.
+    wiredEditorsFocused = []
     wiredDevices = rows
   }
 
@@ -696,6 +801,13 @@ Panel {
 
   function formatPingLatency(ms) {
     return Model.formatPingLatency(ms, hasInternetPing)
+  }
+
+  // The gateway probe: the same formatter, but with its own "has a sample yet"
+  // flag, so a slow first probe holds the row at "--" instead of claiming a
+  // timeout it never measured.
+  function formatRouterLatency() {
+    return Model.formatPingLatency(routerPingLatency, hasRouterPing)
   }
 
   function formatPacketLoss(percent) {
@@ -1013,6 +1125,51 @@ Panel {
     onTriggered: root.refreshWifiIpv4(false)
   }
 
+  // The egress address: one HTTPS request per run, issued by refreshPublicIp()
+  // on open, on an interface change, and here. A slow tick only, because the
+  // address rarely moves -- its job is to catch an exit node that was switched
+  // while the panel sat open, which no interface change announces.
+  Timer {
+    id: publicIpPoll
+    interval: 60000
+    repeat: true
+    running: root.opened
+    onTriggered: root.refreshPublicIp()
+  }
+
+  Process {
+    id: publicIpProc
+    command: [root.publicIpScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.updatePublicIp(text)
+    }
+    onExited: function(exitCode) {
+      root.publicIpBusy = false
+      if (exitCode === 0) return
+      // A lookup that came back with nothing is reported as such instead of
+      // leaving the previous answer on screen: this row exists to say what the
+      // egress is *now*, so a stale address is worse than an honest blank. The
+      // label tooltip and "r" both re-ask.
+      root.publicIp = ""
+      root.publicIpFailed = true
+    }
+  }
+
+  // Being told the active interface changed is the one signal the panel has
+  // that the egress may have moved. The details poll re-reports the same link
+  // every 1.5s, so this compares the interface instead of reacting to every
+  // sample.
+  Connections {
+    target: root
+    function onInfoChanged() {
+      var iface = root.info.iface || ""
+      if (iface === root.publicIpIface) return
+      root.publicIpIface = iface
+      if (iface !== "") root.refreshPublicIp()
+    }
+  }
+
   Timer {
     id: scanRestart
     interval: 100
@@ -1176,9 +1333,13 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      // Freeze the cursor model while the inline password prompt is open;
-      // the TextField inside owns input until Esc/Enter/Cancel.
-      blocked: root.passwordSsid !== ""
+      // Freeze the cursor model while an inline editor owns the keyboard: the
+      // passphrase prompt, the hidden-network form, the IPv4 address fields.
+      // PanelKeyCatcher's own docs put this on the panel, and it matters here --
+      // this handler runs with Keys.BeforeItem priority, so an unannounced
+      // editor is typed into *and* acted on ("w" would switch the radio off
+      // mid-SSID), while space, Enter and j/k/h/l would never reach it at all.
+      blocked: root.passwordSsid !== "" || root.inlineEditorFocused
 
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) {
@@ -1246,8 +1407,12 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "r" || t === "R") root.refresh()
-        else if (t === "w" || t === "W") root.toggleNetwork()
+        if (t === "r" || t === "R") {
+          root.refresh()
+          // "r" refreshes what the panel is showing, and the egress address is
+          // part of that picture -- it is also the only manual way to re-ask.
+          root.refreshPublicIp()
+        } else if (t === "w" || t === "W") root.toggleNetwork()
       }
 
     Column {
@@ -1439,6 +1604,40 @@ Panel {
             copyable: !!root.info.gateway
             tooltipText: "Copy gateway"
           }
+
+          // Closing pair: how fast the LAN answers (the gateway probe the status
+          // helper has always collected) and what the internet sees this
+          // machine as. The two read together on purpose -- when a tunnel is
+          // carrying the traffic the second one stops matching the local link.
+          InfoLabel { text: "Router" }
+          DetailValue { text: root.formatRouterLatency() }
+
+          InfoLabel {
+            id: publicIpLabel
+            text: "Public IP"
+            // The grid has no room for a button, so the label doubles as the
+            // re-check affordance: hovering explains it, clicking re-asks, and
+            // "r" does the same from the keyboard.
+            MouseArea {
+              id: publicIpMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.refreshPublicIp()
+            }
+            PanelToolTip {
+              visible: publicIpMouse.containsMouse
+              text: root.publicIpBusy ? "Looking up the public IP…" : "Look up the public IP again"
+              fontFamily: root.bar.fontFamily
+            }
+          }
+          DetailValue {
+            text: root.publicIpDisplay
+            color: root.publicIpUnavailable ? root.bar.urgent : root.bar.foreground
+            copyable: root.publicIp !== ""
+            tooltipText: "Copy public IP"
+          }
         }
       }
 
@@ -1481,7 +1680,15 @@ Panel {
               onApplyStarted: root.ipv4ApplyBusy = true
               onApplyFinished: root.ipv4ApplyBusy = false
               onDraftStateChanged: root.setWiredDirty(wiredNic.info.key, wiredNic.draftDirty || wiredNic.editing)
+              // The panel's key dispatcher has to stand down while one of these
+              // fields owns the keyboard; see inlineEditorFocused.
+              onEditorFocusChanged: function(focused) { root.setWiredEditorFocused(wiredNic.info.key, focused) }
               onApplied: {
+                // The row is about to be replaced by the profile the apply just
+                // wrote. A delegate that goes away cannot report itself clean,
+                // and an undropped key would keep every later refresh skipping
+                // this NIC for the rest of the session.
+                root.setWiredDirty(wiredNic.info.key, false)
                 root.refreshWiredDevices(true)
                 root.refresh()
               }
@@ -1521,6 +1728,10 @@ Panel {
           applyBusy: root.ipv4ApplyBusy
           onApplyStarted: root.ipv4ApplyBusy = true
           onApplyFinished: root.ipv4ApplyBusy = false
+          // One row, so one constant key: the profile UUID changes with the
+          // network, and a key that outlived its profile would block the key
+          // dispatcher for good.
+          onEditorFocusChanged: function(focused) { root.setPanelEditorFocused("wifi-ipv4", focused) }
           onApplied: {
             // force=true: the apply just rewrote this network's profile, so the
             // fresh state has to replace the draft.
@@ -1768,6 +1979,11 @@ Panel {
           enabled: !root.hiddenBusy
           text: root.hiddenSsid
           onTextChanged: if (text !== root.hiddenSsid) root.hiddenSsid = text
+          // Announced to the panel, so its own shortcuts stand down while this
+          // field is being typed into (see inlineEditorFocused); Esc gives up the
+          // form rather than leaving the keyboard stuck in here.
+          onActiveFocusChanged: root.setPanelEditorFocused("hidden-ssid", activeFocus)
+          Keys.onEscapePressed: root.toggleHiddenNetworkForm()
           onAccepted: hiddenPasswordField.forceActiveFocus()
         }
 
@@ -1784,6 +2000,8 @@ Panel {
           enabled: !root.hiddenBusy
           text: root.hiddenPassword
           onTextChanged: if (text !== root.hiddenPassword) root.hiddenPassword = text
+          onActiveFocusChanged: root.setPanelEditorFocused("hidden-password", activeFocus)
+          Keys.onEscapePressed: root.toggleHiddenNetworkForm()
           onAccepted: root.connectHiddenNetwork()
         }
 

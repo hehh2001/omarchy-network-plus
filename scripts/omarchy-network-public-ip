@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# User-owned helper for zzb.network:
+# Print the public (egress) IP address the internet sees this machine as.
+#
+# The lookup rides the default route, so whatever actually carries the traffic
+# is what answers: with a Tailscale exit node (or any other tunnel) in force
+# this reports the exit's address rather than the one the local link was
+# handed. That is the point of showing it next to the link's own IP -- the two
+# only differ when something in between is rewriting the source.
+#
+# Nothing is cached here. The panel owns the refresh policy (on open, on an
+# interface change, and a slow tick) and re-runs this helper when it wants the
+# answer to move.
+
+# omarchy:summary=Print the public (egress) IP address
+# omarchy:group=network
+
+set -euo pipefail
+export LC_ALL=C
+
+# Plain endpoints that answer with the bare address and nothing else. They are
+# asked in order: one provider being down, rate limited or unhelpful must not
+# turn the panel's row into a permanent placeholder.
+providers=(
+  "https://api.ipify.org"
+  "https://ifconfig.me/ip"
+  "https://icanhazip.com"
+)
+
+# `-4` asks for the IPv4 egress, which is the family this panel describes
+# everywhere else. An address is only accepted when it is a bare, in-range
+# dotted quad: a captive portal answers a request for an IP with an HTML login
+# page, and printing that as the address would be worse than printing nothing.
+valid_ipv4() {
+  local value=${1:-} octet
+
+  [[ $value =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+
+  for octet in ${value//./ }; do
+    ((10#$octet <= 255)) || return 1
+  done
+}
+
+if ! omarchy-cmd-present curl; then
+  echo "Error: curl is required to look up the public IP address." >&2
+  exit 1
+fi
+
+for provider in "${providers[@]}"; do
+  # -f turns an HTTP error into a failure instead of letting an error page
+  # through as the answer. The timeouts keep a black-holed request from
+  # outliving the panel that asked for it.
+  answer=$(curl -4 -fsS --connect-timeout 3 --max-time 4 "$provider" 2>/dev/null | tr -d '[:space:]') || answer=""
+
+  if valid_ipv4 "${answer:-}"; then
+    printf '%s\n' "$answer"
+    exit 0
+  fi
+done
+
+echo "Error: no provider could report a public IPv4 address." >&2
+exit 1

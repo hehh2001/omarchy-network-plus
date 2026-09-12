@@ -29,6 +29,7 @@ Item {
   signal applyFinished()
   signal applied()
   signal draftStateChanged()
+  signal editorFocusChanged(bool focused)
   signal hovered()
 
   // The row is instantiated as soon as its section exists, even while the list
@@ -69,6 +70,12 @@ Item {
   property bool busy: false
   property string statusText: ""
   property bool failed: false
+  // A successful apply rewrites the profile this row is loaded from, so the
+  // owner refreshes right after it lands -- and that reload used to clear
+  // statusText before the "Applied"/"Saved" line could ever be read. The notice
+  // rides through exactly one reload; a fresh edit or a different target drops
+  // it, so it can never be shown against a configuration it did not describe.
+  property bool keepStatusNotice: false
   property string initializedKey: ""
   // The saved configuration this row was loaded from, so a change made
   // elsewhere (another tool, nmcli, a reconnect) can be followed while the row
@@ -83,7 +90,14 @@ Item {
     || gatewayField.activeFocus || dnsField.activeFocus
 
   onDraftDirtyChanged: draftStateChanged()
-  onEditingChanged: draftStateChanged()
+  // Focus alone has to reach the owner too: the panel dispatches keys with
+  // Keys.BeforeItem priority, so it can only shield itself from its own
+  // shortcuts ("w" toggles the radio, "r" refreshes) while it knows a field
+  // holds the keyboard. See Panel.qml's blocked.
+  onEditingChanged: {
+    draftStateChanged()
+    editorFocusChanged(editing)
+  }
 
   // The saved profile values the user would be editing. Live addresses are not
   // part of it: they change on their own and must never reload the row.
@@ -108,8 +122,11 @@ Item {
     draftGateway = info.gateway || ""
     draftDns = info.dns || ""
     busy = false
-    statusText = ""
-    failed = false
+    if (keepStatusNotice) keepStatusNotice = false
+    else {
+      statusText = ""
+      failed = false
+    }
     loadedSignature = infoSignature()
   }
 
@@ -141,8 +158,28 @@ Item {
     loadFromInfo()
   }
 
+  // Closing the panel discards panel-local state, exactly as it does for the
+  // wired rows. Those are rebuilt on the next open; this row is a single
+  // long-lived instance and would otherwise carry a draft, and an "Applied"
+  // notice describing an edit nobody is looking at any more, into the next
+  // open. An apply still in flight is left alone: its own exit path reports it.
+  function discardDraft() {
+    if (busy) return
+    keepStatusNotice = false
+    resetToInfo()
+  }
+
   function markDirty() {
     fieldsDirty = true
+    keepStatusNotice = false
+  }
+
+  // Esc hands the keyboard back to the panel without touching the draft: the
+  // field keeps what was typed and j/k/Enter work again. The panel's own keys
+  // are blocked while a field has focus (see Panel.qml), so without this there
+  // would be no way back out of a field with the keyboard.
+  function releaseFocus() {
+    ipv4Row.forceActiveFocus()
   }
 
   function setMode(nextManual) {
@@ -150,6 +187,7 @@ Item {
     manualMode = nextManual
     statusText = ""
     failed = false
+    keepStatusNotice = false
 
     if (manualMode) {
       if (draftAddress === "") {
@@ -400,6 +438,8 @@ Item {
               ipv4Row.markDirty()
             }
           }
+          // Esc leaves the draft alone and hands the keyboard back to the panel.
+          Keys.onEscapePressed: ipv4Row.releaseFocus()
           onAccepted: prefixField.forceActiveFocus()
         }
 
@@ -420,6 +460,8 @@ Item {
               ipv4Row.markDirty()
             }
           }
+          // Esc leaves the draft alone and hands the keyboard back to the panel.
+          Keys.onEscapePressed: ipv4Row.releaseFocus()
           onAccepted: gatewayField.forceActiveFocus()
         }
       }
@@ -441,6 +483,8 @@ Item {
             ipv4Row.markDirty()
           }
         }
+        // Esc leaves the draft alone and hands the keyboard back to the panel.
+        Keys.onEscapePressed: ipv4Row.releaseFocus()
         onAccepted: dnsField.forceActiveFocus()
       }
 
@@ -454,6 +498,8 @@ Item {
         horizontalPadding: Style.spacing.controlGap
         verticalPadding: Style.spacing.controlPaddingY
         enabled: !ipv4Row.busy && !ipv4Row.applyBusy
+        // Esc leaves the draft alone and hands the keyboard back to the panel.
+        Keys.onEscapePressed: ipv4Row.releaseFocus()
         text: ipv4Row.draftDns
         onTextChanged: {
           if (text !== ipv4Row.draftDns) {
@@ -501,11 +547,15 @@ Item {
       if (exitCode === 0) {
         ipv4Row.failed = false
         ipv4Row.statusText = ipv4Row.info.appliedText || "Applied"
+        // The owner reloads this row from the profile the apply just wrote, and
+        // that reload is what would otherwise erase the line above.
+        ipv4Row.keepStatusNotice = true
         // Clearing initializedKey lets the row reload from the profile the
         // apply just wrote, instead of staying on its old draft.
         ipv4Row.initializedKey = ""
         ipv4Row.applied()
       } else {
+        ipv4Row.keepStatusNotice = false
         ipv4Row.failed = true
         var firstLine = String(applyErr.text || "").trim().split("\n")[0]
         ipv4Row.statusText = firstLine !== "" ? "Failed: " + firstLine : "Apply failed"

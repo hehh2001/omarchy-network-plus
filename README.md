@@ -27,6 +27,9 @@ failure messages.
   network keeps its own settings.
 - Apply a static IP or DHCP change immediately through NetworkManager — no
   reboot required.
+- Inline editors own the keyboard while they are focused (the panel's `r`/`w`
+  shortcuts stand down, so a `w` typed into an SSID is just a `w`), and Esc
+  gives the keyboard back without discarding what was typed.
 - Cleanly reactivate only the selected NIC when switching between DHCP and
   static addressing, then verify the requested live IPv4 state before the UI
   reports success.
@@ -35,6 +38,15 @@ failure messages.
 - Avoids showing Tailscale/tailnet addresses during a DHCP/static transition:
   the status helpers prefer the physical NetworkManager NIC over the
   `tailscale0` route fallback.
+- Shows the **public (egress) IP** beside the link's own address, so a tunnel
+  or exit node that is rewriting the source is visible at a glance. It rides
+  the default route, so with a Tailscale exit node in force it reports that
+  exit's address. The lookup is one HTTPS request, issued when the panel opens,
+  when the active interface changes, and once a minute while the panel stays
+  open; `r` re-checks it on demand, the value is click-to-copy, and a lookup
+  that fails says so rather than leaving a stale address on screen.
+- Shows the **router** (gateway) latency next to it, so the local link and the
+  egress can be read together.
 - Supports multiple managed Ethernet adapters.
 
 ## Requirements
@@ -42,6 +54,7 @@ failure messages.
 - Omarchy with the Quattro shell plugin system.
 - NetworkManager (`nmcli`) managing the Ethernet adapters.
 - `jq` for status/IP parsing.
+- `curl` for the public (egress) IP lookup.
 - `wl-copy` for clipboard copy actions.
 - `iw` is used only when Wi-Fi details are available.
 
@@ -113,13 +126,17 @@ first.
 
 The helpers and the shared row logic ship with regression tests that stub
 `nmcli` (and the kernel's network view), so they run anywhere, need no
-privileges, and touch no real connection:
+privileges, and touch no real connection. The public IP lookup is checked the
+same way, with `curl` stubbed, so no test ever reaches the network or can leak
+the machine's real address:
 
 ```bash
 bash tests/wired-nic-detection-test.sh   # which devices may appear as wired NICs
 bash tests/network-switch-test.sh        # wired DHCP <-> static transitions
 bash tests/wifi-ipv4-test.sh             # Wi-Fi DHCP <-> static transitions
 bash tests/model-ipv4-test.sh            # the wording/state both rows derive
+bash tests/public-ip-test.sh             # the egress address: what counts as one
+bash tests/panel-editor-guards-test.sh   # inline editors own the keys, drafts survive
 ```
 
 ## License
