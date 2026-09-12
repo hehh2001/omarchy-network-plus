@@ -14,6 +14,10 @@ failure messages.
 - Omarchy-native Wi-Fi scanning, connection, disconnection, forgotten
   networks, hidden networks, and QR sharing integration.
 - Wired NIC list with carrier/state/profile status.
+- Only real, attached hardware NICs are listed. Networks that were unplugged,
+  interfaces with nothing behind them, and the Apple T2 chip's always-present
+  bridge Ethernet are filtered out, so once the adapter is gone the whole wired
+  section disappears instead of showing the last NIC that was seen.
 - Switch a wired NIC between **Auto DHCP** and **Manual static IPv4** from
   the bar panel.
 - Apply a static IP or DHCP change immediately through NetworkManager — no
@@ -74,6 +78,16 @@ omarchy plugin remove zzb.network --yes
 No extra configuration is required. Like the built-in network widget, it can
 be placed in any bar section via `omarchy bar` or by editing
 `~/.config/omarchy/shell.json`.
+
+## Testing
+
+Both helpers ship with regression tests that stub `nmcli` and the kernel's
+network view, so they run anywhere:
+
+```bash
+bash tests/wired-nic-detection-test.sh   # which devices may appear as wired NICs
+bash tests/network-switch-test.sh        # DHCP <-> static transitions
+```
 
 ## License
 

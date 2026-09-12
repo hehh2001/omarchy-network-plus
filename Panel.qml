@@ -29,6 +29,13 @@ Panel {
   // { device, carrier, state, profile, method, address, prefix, gateway, dns,
   //   liveIp, liveGateway }
   property var wiredDevices: []
+  // The helper only returns real, attached hardware NICs (it drops unbacked
+  // interfaces and the Apple T2 chip's always-present bridge Ethernet), so an
+  // empty list means there is no wired NIC here. The wired section rides on
+  // this rather than on NetworkManager's device list: NM can keep a device the
+  // adapter was unplugged from, and showing it would look like the panel kept
+  // the last record it saw.
+  readonly property bool hasWiredNics: wiredDevices.length > 0
   // Set while a wired TextField has focus so the poller does not rebuild rows
   // under the user's cursor.
   property string editingWiredDevice: ""
@@ -541,6 +548,27 @@ Panel {
     }
   }
 
+  // Every refresh is authoritative about which NICs are attached, so panel-local
+  // state for a NIC that just disappeared is dropped here. Without it a draft
+  // left on an unplugged adapter would keep the poller paused (both refresh
+  // paths check the dirty list first) and pin stale input on screen, which is
+  // the "kept the last record" behaviour this plugin must not have.
+  function reconcileWiredState(rows) {
+    var present = []
+    var i
+    for (i = 0; i < rows.length; i++) present.push(rows[i].device)
+
+    var dirty = []
+    for (i = 0; i < root.dirtyWiredDevices.length; i++) {
+      var device = root.dirtyWiredDevices[i]
+      if (present.indexOf(device) >= 0) dirty.push(device)
+    }
+    if (dirty.length !== root.dirtyWiredDevices.length) root.dirtyWiredDevices = dirty
+
+    if (root.editingWiredDevice !== "" && present.indexOf(root.editingWiredDevice) < 0)
+      root.editingWiredDevice = ""
+  }
+
   function updateWiredDevices(raw) {
     var lines = String(raw || "").split("\n")
     var rows = []
@@ -563,6 +591,7 @@ Panel {
         liveGateway: p[10]
       })
     }
+    reconcileWiredState(rows)
     wiredDevices = rows
   }
 
@@ -1369,17 +1398,17 @@ Panel {
         }
       }
 
-      // Wired NIC settings. Every NetworkManager-managed wired adapter gets a
-      // row here, even when no cable is plugged in or no DHCP server has
-      // answered, so an external NIC can be switched to a static IP from the
-      // panel before it ever gets an address.
+      // Wired NIC settings. A row appears only for a real, attached NIC --
+      // including one with no cable, so it can be given a static address
+      // before it ever gets one -- and with none attached the section is gone
+      // entirely rather than showing the last adapter that was seen.
       PanelSeparator {
-        visible: root.wiredDevices.length > 0
+        visible: root.hasWiredNics
         foreground: root.bar.foreground
       }
 
       Column {
-        visible: root.wiredDevices.length > 0
+        visible: root.hasWiredNics
         width: parent.width
         spacing: Style.space(10)
 

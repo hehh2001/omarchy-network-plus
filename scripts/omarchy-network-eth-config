@@ -3,6 +3,11 @@
 # User-owned helper for zzb.network:
 # Enumerate NetworkManager-managed wired NICs and switch a NIC's IPv4
 # profile between automatic DHCP and manual static addressing.
+#
+# Only real, attached hardware NICs are listed. Virtual/unbacked interfaces and
+# the Apple T2 chip's always-present bridge Ethernet gadget are filtered out, so
+# an empty list really means "no wired NIC attached" and the panel can hide the
+# whole wired section instead of showing the last adapter it saw.
 
 # omarchy:summary=Show/configure IPv4 settings for managed wired NICs
 # omarchy:group=network
@@ -19,6 +24,12 @@ nm_get() {
   nmcli -e no -g "$field" "$@" 2>/dev/null || true
 }
 
+# Kernel view of the network interfaces. Tests point this at a fixture tree so
+# the hardware checks below can be exercised without touching the live host.
+net_sysfs() {
+  printf '%s\n' "${OMARCHY_NET_SYSFS:-/sys/class/net}"
+}
+
 device_state() {
   local dev=$1
   nmcli -e no -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: -v want="$dev" '
@@ -27,12 +38,58 @@ device_state() {
 }
 
 device_carrier() {
-  local dev=$1
-  if [[ -r /sys/class/net/$dev/carrier ]]; then
-    cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo 0
+  local dev=$1 root
+  root=$(net_sysfs)
+  if [[ -r $root/$dev/carrier ]]; then
+    cat "$root/$dev/carrier" 2>/dev/null || echo 0
   else
     echo 0
   fi
+}
+
+# Whether the kernel still has the hardware behind this interface. A netdev
+# whose `device` link dangles was unplugged while NetworkManager kept the device
+# around; that ghost is what used to linger in the panel as "the last record".
+# Interfaces with no `device` node at all (Thunderbolt IP links, for example)
+# are left alone -- NetworkManager's device type already keeps bridges, bonds,
+# vlans and tunnels out of this list.
+has_hardware() {
+  local dev=$1 root
+  root=$(net_sysfs)
+  [[ -d $root/$dev ]] || return 1
+  if [[ -L $root/$dev/device && ! -e $root/$dev/device ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Apple T2 Macs (apple-bce) publish a virtual CDC-NCM "Apple T2 Controller"
+# Ethernet gadget on their own USB bus. It exists even when no wired NIC is
+# attached, reports carrier=1, and never passes traffic -- NetworkManager just
+# retries DHCP on it forever. It is not a NIC the user attached, so it must
+# never create a row: without this the panel looks like it kept the last
+# adapter, which is exactly the stale record this plugin is not supposed to
+# show. A real Ethernet NIC (Thunderbolt/PCIe/USB-C dock) is a separate device
+# and is unaffected.
+is_t2_bridge_device() {
+  local dev=$1 root path parent vid pid
+  root=$(net_sysfs)
+  path=$(readlink -f "$root/$dev/device" 2>/dev/null) || return 1
+  [[ -n $path ]] || return 1
+  if [[ $path == *t2bce* ]]; then
+    return 0
+  fi
+
+  # USB hosts: the interface node is usbN/<port>/<port>:<config>, so the USB
+  # device that owns it is its parent. PCI devices have no idVendor there.
+  parent=$(dirname -- "$path")
+  vid=$(cat "$parent/idVendor" 2>/dev/null || true)
+  pid=$(cat "$parent/idProduct" 2>/dev/null || true)
+  if [[ $vid == 05ac && $pid == 8233 ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 # Return the UUID of the profile bound to the device. UUIDs are authoritative;
@@ -86,6 +143,16 @@ list_devices() {
   while IFS=: read -r dev type state; do
     [[ $type == ethernet ]] || continue
     [[ $state != unmanaged ]] || continue
+
+    # Only hardware that is actually attached gets a row. Everything below
+    # reads live state from that hardware, and the panel hides the whole wired
+    # section when this emits nothing.
+    if ! has_hardware "$dev"; then
+      continue
+    fi
+    if is_t2_bridge_device "$dev"; then
+      continue
+    fi
 
     carrier=$(device_carrier "$dev")
     state=${state%% *}
