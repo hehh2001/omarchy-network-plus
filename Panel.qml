@@ -1716,7 +1716,10 @@ Panel {
               text: sectionTitle
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
-              height: visible ? implicitHeight : 0
+              // Explicit content height instead of implicitHeight: binding the
+              // height to the property Qt derives from it makes the engine log
+              // a binding loop every time this delegate is built.
+              height: visible ? contentHeight + topPadding + bottomPadding : 0
             }
 
             NetworkRow {
@@ -2067,7 +2070,8 @@ Panel {
           // so rows without status keep a tight one-line look.
           text: row.statusText
           visible: row.statusText !== ""
-          height: visible ? implicitHeight : 0
+          // contentHeight, not implicitHeight: see the section header above.
+          height: visible ? contentHeight : 0
           color: row.statusColor
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption
