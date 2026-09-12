@@ -56,6 +56,13 @@ sameLine(Model.ipv4StateText('disconnected', false, false), 'Disconnected', 'a N
 sameLine(Model.ipv4StateText('unavailable', false, false), 'No cable', 'an unavailable NIC reads No cable')
 sameLine(Model.ipv4StateText('connecting', false, false), 'Connecting', 'a NIC coming up reads Connecting')
 
+// The mode switch stages a change, so the header may not state a mode that is
+// not in force yet: while the two differ it names both, saved mode first.
+sameLine(Model.ipv4ModeLabel(false, false), 'AUTO DHCP', 'an unchanged automatic mode reads AUTO DHCP')
+sameLine(Model.ipv4ModeLabel(true, true), 'MANUAL', 'an unchanged manual mode reads MANUAL')
+sameLine(Model.ipv4ModeLabel(false, true), 'MANUAL → AUTO DHCP', 'a flip to DHCP names the mode still in force first')
+sameLine(Model.ipv4ModeLabel(true, false), 'AUTO DHCP → MANUAL', 'a flip to MANUAL names the mode still in force first')
+
 sameLine(Model.ipv4DhcpButtonText(true, false, false), 'Apply DHCP & connect', 'a connected NIC applies DHCP and connects')
 sameLine(Model.ipv4DhcpButtonText(false, true, false), 'Apply DHCP & connect', 'a NIC with a cable applies DHCP and connects')
 sameLine(Model.ipv4DhcpButtonText(false, false, false), 'Save DHCP', 'a NIC without a cable only saves DHCP')

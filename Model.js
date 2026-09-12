@@ -422,6 +422,19 @@ function ipv4StateText(state, linkPresent, wireless) {
   return "Unknown"
 }
 
+// The mode switch stages a change: nothing is written to the profile until the
+// Apply beside it runs, which matters most on a NIC with no cable, where there
+// is nothing to activate and the profile is only saved. The header therefore
+// states what the profile says *now*, and names the requested mode separately
+// while the two differ -- "MANUAL -> AUTO DHCP" -- so a flip can never read as
+// a mode already in force. Once they agree the label is just the mode again.
+function ipv4ModeLabel(manualMode, manualSaved) {
+  var staged = manualMode ? "MANUAL" : "AUTO DHCP"
+  var saved = manualSaved ? "MANUAL" : "AUTO DHCP"
+
+  return staged === saved ? saved : saved + " → " + staged
+}
+
 function ipv4DhcpButtonText(connected, linkPresent, wireless) {
   if (wireless) return connected ? "Apply DHCP & reconnect" : "Save DHCP"
   return (connected || linkPresent) ? "Apply DHCP & connect" : "Save DHCP"
@@ -527,6 +540,7 @@ if (typeof module !== "undefined") {
     publicIpAddress: publicIpAddress,
     publicIpText: publicIpText,
     ipv4StateText: ipv4StateText,
+    ipv4ModeLabel: ipv4ModeLabel,
     ipv4DhcpButtonText: ipv4DhcpButtonText,
     ipv4ApplyingText: ipv4ApplyingText,
     ipv4AppliedText: ipv4AppliedText,

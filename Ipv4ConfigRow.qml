@@ -5,6 +5,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
+import "Model.js" as Model
 
 // One IPv4 configuration row: automatic DHCP versus a manual static address,
 // the static form, and the apply/reset actions. The wired NIC list and the
@@ -312,8 +313,10 @@ Item {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
 
+        // The label never claims a mode that is not in force: while a flip is
+        // still unapplied it reads "MANUAL -> AUTO DHCP" (see Model.js).
         Text {
-          text: ipv4Row.manualMode ? "MANUAL" : "AUTO DHCP"
+          text: Model.ipv4ModeLabel(ipv4Row.manualMode, ipv4Row.manualSaved)
           color: Qt.darker(ipv4Row.bar.foreground, 1.4)
           font.family: ipv4Row.bar.fontFamily
           font.pixelSize: Style.font.caption

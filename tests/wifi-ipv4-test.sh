@@ -347,6 +347,8 @@ grep -q 'function infoSignature()' "$root/Ipv4ConfigRow.qml" \
   || fail "the shared row can tell a saved change from a draft"
 grep -q 'if (draftDirty || editing || busy) return' "$root/Ipv4ConfigRow.qml" \
   || fail "the shared row never overwrites a draft with a saved change"
+grep -q 'text: Model.ipv4ModeLabel(ipv4Row.manualMode, ipv4Row.manualSaved)' "$root/Ipv4ConfigRow.qml" \
+  || fail "the mode header states the saved mode, not a staged flip"
 pass "the shared row follows saved changes and protects drafts"
 
 printf '\nwifi ipv4 test: pass\n'
