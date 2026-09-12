@@ -84,6 +84,33 @@ No extra configuration is required. Like the built-in network widget, it can
 be placed in any bar section via `omarchy bar` or by editing
 `~/.config/omarchy/shell.json`.
 
+## Apple T2 Macs
+
+T2 Macs always expose a virtual CDC-NCM Ethernet gadget — "Apple T2 Controller",
+USB `05ac:8233`, an interface such as `enp4s0f1u1`. It is not a real Ethernet
+port: it exists with no adapter attached, reports `carrier=1` anyway, and never
+completes DHCP. The plugin already leaves it out of the wired NIC section, so
+nothing is required for the UI to be correct.
+
+If NetworkManager's own retries bother you — it activates that gadget over and
+over while the driver logs transmit timeouts — also tell NetworkManager to leave
+it alone:
+
+```ini
+# /etc/NetworkManager/conf.d/10-t2-unmanaged.conf
+[keyfile]
+unmanaged-devices=interface-name:enp4s0f1u1
+```
+
+```bash
+sudo systemctl reload NetworkManager
+```
+
+This is a system setting the plugin never writes itself. Note that
+NetworkManager replaces `unmanaged-devices` per key across `conf.d` files
+instead of merging the lists, so keep every pattern on that one line — a second
+file silently overrides the first.
+
 ## Testing
 
 The helpers and the shared row logic ship with regression tests that stub
