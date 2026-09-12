@@ -93,8 +93,9 @@ completes DHCP. The plugin already leaves it out of the wired NIC section, so
 nothing is required for the UI to be correct.
 
 If NetworkManager's own retries bother you — it activates that gadget over and
-over while the driver logs transmit timeouts — also tell NetworkManager to leave
-it alone:
+over while the driver logs transmit timeouts — its configuration can be told to
+leave the gadget alone. That drop-in and the reload that applies it are yours to
+add as root, exactly like any other system setting:
 
 ```ini
 # /etc/NetworkManager/conf.d/10-t2-unmanaged.conf
@@ -102,14 +103,11 @@ it alone:
 unmanaged-devices=interface-name:enp4s0f1u1
 ```
 
-```bash
-sudo systemctl reload NetworkManager
-```
-
-This is a system setting the plugin never writes itself. Note that
-NetworkManager replaces `unmanaged-devices` per key across `conf.d` files
-instead of merging the lists, so keep every pattern on that one line — a second
-file silently overrides the first.
+The plugin never writes this file and never asks for elevation; it only reads
+what NetworkManager reports. Note that NetworkManager replaces
+`unmanaged-devices` per key across `conf.d` files instead of merging the lists,
+so keep every pattern on that one line — a second file silently overrides the
+first.
 
 ## Testing
 
