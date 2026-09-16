@@ -43,8 +43,11 @@ failure messages.
   the default route, so with a Tailscale exit node in force it reports that
   exit's address. The lookup is one HTTPS request, issued when the panel opens,
   when the active interface changes, and once a minute while the panel stays
-  open; `r` re-checks it on demand, the value is click-to-copy, and a lookup
-  that fails says so rather than leaving a stale address on screen.
+  open; the response is read under a small fixed byte cap and a larger body is
+  refused rather than truncated, so a misbehaving or hostile endpoint cannot
+  make the helper buffer an unbounded body; `r` re-checks it on demand, the
+  value is click-to-copy, and a lookup that fails says so rather than leaving a
+  stale address on screen.
 - Shows the **router** (gateway) latency next to it, so the local link and the
   egress can be read together.
 - Supports multiple managed Ethernet adapters.

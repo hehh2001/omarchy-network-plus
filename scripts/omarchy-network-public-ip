@@ -47,11 +47,26 @@ if ! omarchy-cmd-present curl; then
   exit 1
 fi
 
+# The most any one provider is allowed to make this helper buffer. A bare
+# address is at most 15 characters, so a longer body is not an answer: it is a
+# login page, an error page, or an endpoint that keeps sending until the timeout
+# expires. The cap is enforced while reading, not after, so an oversized body is
+# refused rather than truncated into something that happens to parse.
+max_response_bytes=64
+
 for provider in "${providers[@]}"; do
   # -f turns an HTTP error into a failure instead of letting an error page
   # through as the answer. The timeouts keep a black-holed request from
-  # outliving the panel that asked for it.
-  answer=$(curl -4 -fsS --connect-timeout 3 --max-time 4 "$provider" 2>/dev/null | tr -d '[:space:]') || answer=""
+  # outliving the panel that asked for it. `head -c` reads one byte past the cap
+  # and then closes the pipe, so a larger body fails closed: the broken pipe
+  # makes curl exit non-zero, pipefail turns that into a failed pipeline, and
+  # the provider is skipped without its response ever being buffered whole.
+  answer=$(curl -4 -fsS --connect-timeout 3 --max-time 4 "$provider" 2>/dev/null \
+    | head -c $((max_response_bytes + 1)) | tr -d '[:space:]') || answer=""
+
+  # A body that reached the cap is one this helper refused to read to the end,
+  # so even a valid-looking prefix must never be taken as the address.
+  (( ${#answer} <= max_response_bytes )) || answer=""
 
   if valid_ipv4 "${answer:-}"; then
     printf '%s\n' "$answer"

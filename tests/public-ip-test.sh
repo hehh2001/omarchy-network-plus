@@ -56,6 +56,15 @@ case $mode in
   out-of-range) printf '%s' '999.1.1.1' ;;
   empty) ;;
   broken) exit 22 ;;
+  # Far more than the helper is ever willing to buffer: the read has to stop at
+  # the cap, and the provider has to fail closed rather than be drained whole.
+  flood) head -c 1048576 /dev/zero | tr '\0' x ;;
+  # A real address followed by the same flood, to prove a valid-looking prefix
+  # of an oversized body is not accepted either.
+  answer-then-flood)
+    printf '%s' "${CURL_ANSWER:-203.0.113.9}"
+    head -c 1048576 /dev/zero | tr '\0' x
+    ;;
   *) printf '%s' "${CURL_ANSWER:-203.0.113.9}" ;;
 esac
 EOF
@@ -118,6 +127,19 @@ fi
 [[ $(grep -c '^url ' "$tmp/curl.log") -eq 3 ]] \
   || fail "every provider is asked before giving up" "$(cat "$tmp/curl.log")"
 pass "every provider is asked before the lookup gives up"
+
+# The response is read under a small fixed byte cap, so an endpoint that keeps
+# sending cannot make the helper buffer an unbounded body -- and a valid address
+# followed by a flood must not be accepted from its prefix either.
+for mode in flood answer-then-flood; do
+  reset_curl "$mode"
+  if output=$(run_helper 2>"$tmp/stderr"); then
+    fail "$mode is not reported as an address" "$output"
+  fi
+  [[ -z $output ]] || fail "$mode prints nothing on stdout" "$output"
+  [[ -s "$tmp/stderr" ]] || fail "$mode explains itself on stderr"
+  pass "$mode is refused instead of being buffered or truncated"
+done
 
 # --------------------------------------------------------- model contract ----
 
