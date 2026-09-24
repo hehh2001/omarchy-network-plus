@@ -1688,9 +1688,14 @@ Panel {
                 // wrote. A delegate that goes away cannot report itself clean,
                 // and an undropped key would keep every later refresh skipping
                 // this NIC for the rest of the session.
-                root.setWiredDirty(wiredNic.info.key, false)
-                root.refreshWiredDevices(true)
-                root.refresh()
+                //
+                // Capture the panel first: refreshWiredDevices(true) replaces
+                // the wired Repeater's model, which destroys this delegate
+                // synchronously, so `root` cannot be resolved afterwards.
+                var panel = root
+                panel.setWiredDirty(wiredNic.info.key, false)
+                panel.refreshWiredDevices(true)
+                panel.refresh()
               }
               onHovered: root.cursorActive = false
             }
@@ -2116,12 +2121,22 @@ Panel {
     Connections {
       target: row.net ? root.networkForSsid(row.net.ssid) : null
       function onConnectionFailed(reason) {
+        // Snapshot everything this handler needs before failNetworkAction().
+        // That call reaches refresh() -> syncWifiNetworks(), which replaces the
+        // Wi-Fi ListView model and destroys this row (and the inline component
+        // scope `root` is resolved through) synchronously. Reading `root` or
+        // `row` after it throws "ReferenceError: root is not defined".
+        var panel = root
+        var net = row.net
+        var ssid = net ? (net.ssid || "") : ""
+        var needsCredentials = row.requiresCredentials
         // Background auto-connect retries fire this too; only reprompt for
         // the connect started from this panel. Checked before
         // failNetworkAction, which clears the action state.
-        var ours = root.actionKind === "connect" && root.actionSsid === (row.net.ssid || "")
-        root.failNetworkAction(root.networkForSsid(row.net.ssid), reason)
-        if (ours && root.shouldRepromptPassphrase(reason, row.requiresCredentials)) root.openPasswordPrompt(row.net.ssid)
+        var reprompt = panel.actionKind === "connect" && panel.actionSsid === ssid
+          && panel.shouldRepromptPassphrase(reason, needsCredentials)
+        panel.failNetworkAction(panel.networkForSsid(ssid), reason)
+        if (reprompt) panel.openPasswordPrompt(ssid)
       }
       function onConnectedChanged() {
         if (row.net) root.checkActionCompletion(root.networkForSsid(row.net.ssid))
